@@ -52,6 +52,77 @@ type Global =
             Global.instance := f !Global.instance
         static member askClient = (!Global.instance).client()
 
+module ExperementalExample =
+    open TeleSharp.TL
+
+    type TelegramClient = NoneClient | RealClient of (unit -> TLSharp.Core.TelegramClient)
+    type TelegramStatus = { isAuthorized : bool }
+
+    type Global =
+        { client : TelegramClient
+          status : TelegramStatus
+          history : Map<string, Domain.Snapshot list> }
+
+    type TelegramEff =
+        | SendCodeRequest of phone : string
+        | MakeAuthRequest of phone : string * hash : string * code : string
+        | SendRequest of Contacts.TLRequestResolveUsername * (Messages.TLAbsMessages -> Global -> Global)
+
+    type Eff =
+        | UpdateGlobalEff of (Global -> Global)
+        | TelegramEff of TelegramEff
+
+    type Next =
+        | Next of Eff * (Global -> Next) 
+        | Terminate 
+        | TerminateWithError of string
+
+    module Domain =
+        open Suave.Form
+        open TLSharp.Core
+        open TeleSharp.TL.Contacts
+    
+        let mkClient r (_ : Global) =
+            let clientUpdated phone (state : Global) =
+                if state.status.isAuthorized 
+                    then Terminate
+                    else Next ^ (TelegramEff ^ SendCodeRequest phone, fun _ -> Terminate)
+    
+            let isInt : Validation<string> = (Int32.TryParse >> fst), (sprintf "must be at int"), ("", "")
+            let formDesc : Form<{| appId : string; apiHash : string; phone : string |}> =
+                Form ([ TextProp ((fun f -> <@ f.appId @>), [ isInt ])
+                        TextProp ((fun f -> <@ f.apiHash @>), [ maxLength 256 ])
+                        TextProp ((fun f -> <@ f.phone @>), [ maxLength 32 ]) ], [])
+            match bindForm formDesc r with 
+            | Choice1Of2 x -> 
+                let client = RealClient ^ fun _ -> new TelegramClient(int x.appId, x.apiHash)
+                let eff = UpdateGlobalEff ^ fun db -> { db with client = client }
+                Next (eff, clientUpdated x.phone)
+            | Choice2Of2 e -> TerminateWithError e
+
+        let reset r (_ : Global) =
+            let formDesc : Form<{| hash : string; code : string; phone : string |}> =
+                Form ([ TextProp ((fun f -> <@ f.hash @>), [ maxLength 256 ])
+                        TextProp ((fun f -> <@ f.code @>), [ maxLength 256 ])
+                        TextProp ((fun f -> <@ f.phone @>), [ maxLength 32 ]) ], [])
+            match bindForm formDesc r  with
+            | Choice1Of2 x ->
+                let eff =
+                    MakeAuthRequest (x.phone, x.hash, x.code)
+                    |> TelegramEff
+                Next (eff, fun _ -> Terminate)
+            | Choice2Of2 e -> TerminateWithError e
+
+        let getNodes (uri : Uri) (_ : Global) = 
+            let chatName = uri.Segments.[1]
+            let saveHistory (uri : Uri) (r : Messages.TLAbsMessages) (db : Global) =
+                let history = Domain.parse r chatName
+                { db with history = Map.add chatName history db.history }
+            TLRequestResolveUsername(Username = chatName)
+            |> fun r -> SendRequest (r, saveHistory uri)
+            |> TelegramEff
+            |> fun eff -> Next (eff, fun _ -> Terminate)
+    
 module TelegramConnector =
     open TLSharp.Core
     open TeleSharp.TL.Contacts
