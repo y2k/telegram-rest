@@ -1,4 +1,6 @@
-﻿open System
+﻿module TelegramRest
+
+open System
 open TeleSharp.TL
 
 [<AutoOpen>]
@@ -13,35 +15,29 @@ module Prelude =
 
     module Result =
         let unwrap = function Ok x -> x | Error e -> failwith e
+        let wrap f = try f () |> Ok with e -> Error e
 
     type Microsoft.FSharp.Control.AsyncBuilder with
         member __.Bind(t : Threading.Tasks.Task<'T>, f:'T -> Async<'R>) : Async<'R>  = 
             async.Bind(Async.AwaitTask t, f)
 
 type Snapshot = { title : string; uri : Uri }
-type TelegramClient = NoneClient | RealClient of (unit -> TLSharp.Core.TelegramClient)
-type TelegramStatus = { isAuthorized : bool; code : string }
+type TelegramClient = NoneClient | RealClient of Lazy<TLSharp.Core.TelegramClient>
+type TelegramStatus = { code : string }
 
 type Global =
     { client : TelegramClient
       status : TelegramStatus
       chats : Map<string, TLInputPeerChannel>
       history : Map<string, Snapshot list> }
-    with static member empty = { client = NoneClient; chats = Map.empty; status = { isAuthorized = false; code = "" }; history = Map.empty }
+    with static member empty = { client = NoneClient; chats = Map.empty; status = { code = "" }; history = Map.empty }
 
-type TelegramEff =
-    | SendCodeRequest of phone : string * (string -> Global -> Global)
+type 'a Eff =
+    | SendCodeRequest of phone : string * (string -> 'a -> 'a * 'a Eff)
     | MakeAuthRequest of phone : string * hash : string * code : string
-    | ResolveUsernamRequest of Contacts.TLRequestResolveUsername * (Contacts.TLResolvedPeer -> Global -> Result<Global, string>)
-    | GetHistoryRequest of TLAbsInputPeer * limit : int * (Messages.TLAbsMessages -> Global -> Global)
-
-type Eff =
-    | UpdateGlobalEff of (Global -> Global)
-    | TelegramEff of TelegramEff
-
-type Next =
-    | Next of Eff * (Global -> Next) 
-    | Terminate 
+    | ResolveUsernamRequest of Contacts.TLRequestResolveUsername * (Contacts.TLResolvedPeer -> 'a -> 'a * 'a Eff)
+    | GetHistoryRequest of TLAbsInputPeer * limit : int * (Messages.TLAbsMessages -> 'a -> 'a * 'a Eff)
+    | Terminate
     | TerminateWithError of string
 
 module Domain =
@@ -49,55 +45,41 @@ module Domain =
     open TLSharp.Core
     open TeleSharp.TL.Contacts
 
-    let resetClient r (_ : Global) =
-        let clientUpdated phone (state : Global) =
-            if state.status.isAuthorized 
-                then Terminate
-                else 
-                    SendCodeRequest (phone, fun code db -> { db with status = { db.status with code = code }})
-                    |> TelegramEff
-                    |> fun eff -> Next (eff, fun _ -> Terminate)
+    let resetClient r (db : Global) =
+        let onTokenReceived code db = 
+            { db with status = { db.status with code = code } }, Terminate
 
         let isInt : Validation<string> = (Int32.TryParse >> fst), (sprintf "must be an int"), ("", "")
         let formDesc : Form<{| appId : string; apiHash : string; phone : string |}> =
             Form ([ TextProp ((fun f -> <@ f.appId @>), [ isInt ])
                     TextProp ((fun f -> <@ f.apiHash @>), [ maxLength 256 ])
                     TextProp ((fun f -> <@ f.phone @>), [ maxLength 32 ]) ], [])
+
         match bindForm formDesc r with 
         | Choice1Of2 x -> 
-            let client = RealClient ^ fun _ -> new TelegramClient(int x.appId, x.apiHash)
-            let eff = UpdateGlobalEff ^ fun db -> { db with client = client }
-            Next (eff, clientUpdated x.phone)
-        | Choice2Of2 e -> TerminateWithError e
+            let client = RealClient ^ lazy(new TelegramClient(int x.appId, x.apiHash))
+            { db with client = client }, 
+            SendCodeRequest (x.phone, onTokenReceived)
+        | Choice2Of2 e -> db, TerminateWithError e
 
     let resetClient' r =
-        (fun db -> sprintf "Code: %s" db.status.code), resetClient r
+        (fun db -> sprintf "Code: %s" db.status.code |> Text.Encoding.UTF8.GetBytes), 
+        resetClient r
 
-    let login r (_ : Global) =
+    let login r (db : Global) =
         let formDesc : Form<{| hash : string; code : string; phone : string |}> =
             Form ([ TextProp ((fun f -> <@ f.hash @>), [ maxLength 256 ])
                     TextProp ((fun f -> <@ f.code @>), [ maxLength 256 ])
                     TextProp ((fun f -> <@ f.phone @>), [ maxLength 32 ]) ], [])
         match bindForm formDesc r  with
-        | Choice1Of2 x ->
-            let eff =
-                MakeAuthRequest (x.phone, x.hash, x.code)
-                |> TelegramEff
-            Next (eff, fun _ -> Terminate)
-        | Choice2Of2 e -> TerminateWithError e
+        | Choice1Of2 x -> db, MakeAuthRequest (x.phone, x.hash, x.code)
+        | Choice2Of2 e -> db, TerminateWithError e
 
-    let getHistory chatName (_ : Global) = 
-        let saveChat (response : TLResolvedPeer) db = 
-            if Seq.isEmpty response.Chats 
-                then Error ^ sprintf "Can't find chat in %O" response
-                else
-                    let channel = response.Chats.[0] :?> TLChannel
-                    TLInputPeerChannel(ChannelId = channel.Id, AccessHash = channel.AccessHash.Value)
-                    |> Ok
-            |> Result.map ^ fun r -> { db with chats = Map.add chatName r db.chats }
-
-        let saveHistory (db : Global) =
-            let parse (messages : Messages.TLAbsMessages) db =
+    let getHistory uri (db : Global) =
+        match Result.wrap (fun _ -> (Uri uri).Segments.[1]) with
+        | Error e -> db, TerminateWithError ^ sprintf "Error parse url: %s\n%O" uri e
+        | Ok chatName -> 
+            let onMessagesLoaded (messages : Messages.TLAbsMessages) db =
                 let history =
                     (messages :?> Messages.TLChannelMessages).Messages
                     |> Seq.choose ^ function | :? TLMessage as x -> Some x | _ -> None
@@ -106,48 +88,60 @@ module Domain =
                           uri = Uri <| sprintf "https://t.me/%s/%i" chatName x.Id }
                     |> Seq.rev
                     |> Seq.toList
-                { db with history = Map.add chatName history db.history }
-            let r = Map.find chatName db.chats
-            GetHistoryRequest (r, 50, parse)
-            |> TelegramEff
-            |> fun eff -> Next (eff, fun _ -> Terminate)
-        
-        TLRequestResolveUsername(Username = chatName)
-        |> fun r -> ResolveUsernamRequest (r, saveChat)
-        |> TelegramEff
-        |> fun eff -> Next (eff, saveHistory)
+                { db with history = Map.add chatName history db.history }, Terminate
+            let onChatResolved (response : TLResolvedPeer) db =
+                if Seq.isEmpty response.Chats 
+                    then Error ^ sprintf "Can't find chat in %O" response
+                    else
+                        let channel = response.Chats.[0] :?> TLChannel
+                        TLInputPeerChannel(ChannelId = channel.Id, AccessHash = channel.AccessHash.Value)
+                        |> Ok
+                |> function
+                | Ok r -> db, GetHistoryRequest(r, 50, onMessagesLoaded)
+                | Error e -> db, TerminateWithError e
+
+            TLRequestResolveUsername(Username = chatName)
+            |> fun r -> db, ResolveUsernamRequest (r, onChatResolved)
 
     let getHistory' (uri : string) =
         let chatName = Uri uri |> fun uri -> uri.Segments.[1]
         let getHistoryFromDb db =
             Map.tryFind chatName db.history 
             |> Option.defaultValue []
-        getHistoryFromDb, (getHistory chatName)
+            |> Suave.Json.toJson
+        getHistoryFromDb, (getHistory uri)
 
 module Interpretator =
     let state = ref Global.empty
 
-    let rec invoke (terminate : Global -> 'a) (f : Global -> Next) : 'a Async =
+    let rec invoke terminate f =
         async {
             printfn "LOG :: -in-> invoke() | state = %O" !state
-            match f !state with
-            | Next (eff, f) ->
-                match eff with
-                | UpdateGlobalEff g -> state := g !state
-                | TelegramEff teff -> 
-                    let client = match (!state).client with RealClient f -> f() | NoneClient -> failwith "no client"
-                    match teff with
-                    | SendCodeRequest (phone, f) -> 
-                        let! code = client.SendCodeRequestAsync phone
-                        state := f code !state
-                    | MakeAuthRequest (p, h, c) -> do! client.MakeAuthAsync(p, h, c)
-                    | ResolveUsernamRequest (r, f) -> 
-                        let! a = client.SendRequestAsync<TeleSharp.TL.Contacts.TLResolvedPeer>(r)
-                        state := f a !state |> Result.unwrap
-                    | GetHistoryRequest (p, l, f) ->
-                        let! a = client.GetHistoryAsync(p, 0, 0, l)
-                        state := f a !state
-                return! invoke terminate f
+            let (a, b) = f !state
+            state := a
+            match b with
+            | SendCodeRequest (phone, f) -> 
+                let client = match (!state).client with RealClient f -> f.Value | NoneClient -> failwith "no client"
+                let! code = client.SendCodeRequestAsync phone
+                let (a, b) = f code !state
+                state := a
+                return! invoke terminate (fun db -> db, b)
+            | MakeAuthRequest (p, h, c) -> 
+                let client = match (!state).client with RealClient f -> f.Value | NoneClient -> failwith "no client"
+                do! client.MakeAuthAsync(p, h, c)
+                return terminate !state
+            | ResolveUsernamRequest (r, f) -> 
+                let client = match (!state).client with RealClient f -> f.Value | NoneClient -> failwith "no client"
+                let! a = client.SendRequestAsync<TeleSharp.TL.Contacts.TLResolvedPeer>(r)
+                let (b, c) = f a !state
+                state := b
+                return! invoke terminate (fun db -> db, c)
+            | GetHistoryRequest (p, l, f) ->
+                let client = match (!state).client with RealClient f -> f.Value | NoneClient -> failwith "no client"
+                let! a = client.GetHistoryAsync(p, 0, 0, l)
+                let (b, c) = f a !state
+                state := b
+                return! invoke terminate (fun db -> db, c)
             | Terminate -> 
                 let result = terminate !state
                 printfn "LOG :: <-out- invoke() | state = %O | result = %O" !state result
@@ -162,22 +156,17 @@ module Server =
     open Suave.Filters
     open Suave.Operators
 
-    let reset = 
-        request ^ fun r ctx -> async {
+    let start pass =
+        let reset = request ^ fun r ctx -> async {
             let! result = Domain.resetClient' r ||> Interpretator.invoke
-            return! Successful.OK result ctx }
-
-    let setCode = 
-        request ^ fun r ctx -> async {
+            return! Successful.ok result ctx }
+        let setCode = request ^ fun r ctx -> async {
             do! Domain.login r |> Interpretator.invoke ignore
             return! Successful.NO_CONTENT ctx }
-
-    let simleRead (uri : string) =
-        request ^ fun _ ctx -> async {
+        let simleRead (uri : string) = request ^ fun _ ctx -> async {
             let! result = Domain.getHistory' uri ||> Interpretator.invoke
-            return! Successful.ok (Json.toJson result) ctx }
+            return! Successful.ok result ctx }
 
-    let start pass =
         choose [
             POST >=> pathScan "/simple-read/%s" simleRead
             Authentication.authenticateBasic

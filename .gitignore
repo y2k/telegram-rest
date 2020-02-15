@@ -1,3 +1,5 @@
 bin/
 obj/
-.ionide
+.ionide/
+tests.fsx
+.DS_Store
