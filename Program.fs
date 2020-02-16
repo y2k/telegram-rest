@@ -116,10 +116,10 @@ module Interpretator =
 
     let rec invoke terminate f =
         async {
-            printfn "LOG :: -in-> invoke() | state = %O" !state
-            let (a, b) = f !state
-            state := a
-            match b with
+            let (newDb, eff) = f !state
+            printfn "LOG :: -in-> invoke() | eff = %O | old = %O | new = %O" eff !state newDb
+            state := newDb
+            match eff with
             | SendCodeRequest (phone, f) -> 
                 let client = match (!state).client with RealClient f -> f.Value | NoneClient -> failwith "no client"
                 let! code = client.SendCodeRequestAsync phone
