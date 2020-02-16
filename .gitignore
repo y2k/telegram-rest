@@ -3,3 +3,4 @@ obj/
 .ionide/
 tests.fsx
 .DS_Store
+session.dat
