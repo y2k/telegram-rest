@@ -19,15 +19,16 @@ module Prelude =
     module Result =
         let unwrap = function Ok x -> x | Error e -> failwith e
         let wrap f = try f () |> Ok with e -> Error e
-
     type Microsoft.FSharp.Control.AsyncBuilder with
-        member __.Bind(t : Threading.Tasks.Task<'T>, f:'T -> Async<'R>) : Async<'R>  = 
+        member __.Bind (t : Threading.Tasks.Task<'T>, f:'T -> Async<'R>) : Async<'R> =
             async.Bind(Async.AwaitTask t, f)
+        member __.ReturnFrom (t : Threading.Tasks.Task<'T>) : Async<'T> = 
+            async.ReturnFrom(Async.AwaitTask t)
 
-type Snapshot = { title : string; author : string; uri : Uri }
-type TelegramClient = NoneClient | RealClient of appId : string * apiHash : string * Lazy<TLSharp.Core.TelegramClient>
-type TelegramStatus = { hash : string; phone : string; authorized : bool }
-    with static member empty = { hash = ""; phone = ""; authorized = false }
+type Snapshot = { title : string; author : string }
+type TelegramClient = NoneClient | RealClient of appId : int * apiHash : string * Lazy<TLSharp.Core.TelegramClient>
+type TelegramStatus = { hash : string; phone : string; authorized : bool; appId : int; apiHash : string }
+    with static member empty = { hash = ""; phone = ""; authorized = false; appId = 0; apiHash = "" }
 
 type Global =
     { client : TelegramClient
@@ -36,14 +37,23 @@ type Global =
       history : Map<string, Snapshot list> }
     with static member empty = { client = NoneClient; chats = Map.empty; status = TelegramStatus.empty; history = Map.empty }
 
-type 'a Eff =
-    | ConnectEff of (bool -> 'a -> 'a * 'a Eff)
-    | SendCodeRequest of phone : string * (string -> 'a -> 'a * 'a Eff)
-    | MakeAuthRequest of phone : string * hash : string * code : string
-    | ResolveUsernamRequest of Contacts.TLRequestResolveUsername * (Contacts.TLResolvedPeer -> 'a -> 'a * 'a Eff)
-    | GetHistoryRequest of TLAbsInputPeer * limit : int * (Messages.TLAbsMessages -> 'a -> 'a * 'a Eff)
+type Eff =
+    | ConnectEff of (bool -> Global -> Global * Eff)
+    | SendCodeRequest of phone : string * (string -> Global -> Global * Eff)
+    | MakeAuthRequest of phone : string * hash : string * code : string * (TLUser -> Global -> Global * Eff)
+    | ResolveUsernamRequest of Contacts.TLRequestResolveUsername * (Contacts.TLResolvedPeer -> Global -> Global * Eff)
+    | GetHistoryRequest of TLAbsInputPeer * limit : int * (Messages.TLAbsMessages -> Global -> Global * Eff)
     | Terminate
     | TerminateWithError of string
+    // with static member map f = function 
+    //       | ConnectEff x -> ConnectEff (fun r ->)
+    //       // | SendCodeRequest of phone : string * (string -> 'a -> 'a * 'a Eff)
+    //       // | MakeAuthRequest of phone : string * hash : string * code : string * (TLUser -> 'a -> 'a * 'a Eff)
+    //       // | ResolveUsernamRequest of Contacts.TLRequestResolveUsername * (Contacts.TLResolvedPeer -> 'a -> 'a * 'a Eff)
+    //       // | GetHistoryRequest of TLAbsInputPeer * limit : int * (Messages.TLAbsMessages -> 'a -> 'a * 'a Eff)
+    //       | Terminate -> Terminate
+    //       | TerminateWithError e -> TerminateWithError e
+    //       | _ -> TODO()
 
 module Domain =
     open Suave.Form
@@ -58,14 +68,11 @@ module Domain =
                 then { db with status = { db.status with authorized = isAuthorized } }, Terminate
                 else { db with status = { db.status with authorized = isAuthorized } }, SendCodeRequest (phone, onTokenReceived)
 
-        let isInt : Validation<string> = (Int32.TryParse >> fst), (sprintf "must be an int"), ("", "")
-        let formDesc : Form<{| appId : string; apiHash : string; phone : string |}> =
-            Form ([ TextProp ((fun f -> <@ f.appId @>), [ isInt ])
-                    TextProp ((fun f -> <@ f.apiHash @>), [ maxLength 256 ])
-                    TextProp ((fun f -> <@ f.phone @>), [ maxLength 32 ]) ], [])
+        let formDesc : Form<{| phone : string |}> =
+            Form ([ TextProp ((fun f -> <@ f.phone @>), [ maxLength 32 ]) ], [])
         match bindForm formDesc r with 
-        | Choice1Of2 x -> 
-            { db with client = RealClient (x.appId, x.apiHash, lazy(new TelegramClient(int x.appId, x.apiHash))) }, 
+        | Choice1Of2 x ->
+            { db with client = RealClient (db.status.appId, db.status.apiHash, lazy(new TelegramClient(db.status.appId, db.status.apiHash))) }, 
             ConnectEff ^ onConnected x.phone
         | Choice2Of2 e -> db, TerminateWithError e
 
@@ -73,7 +80,7 @@ module Domain =
         let formDesc : Form<{| code : string |}> =
             Form ([ TextProp ((fun f -> <@ f.code @>), [ maxLength 8 ]) ], [])
         match bindForm formDesc r  with
-        | Choice1Of2 x -> db, MakeAuthRequest (db.status.phone, db.status.hash, x.code)
+        | Choice1Of2 x -> db, MakeAuthRequest (db.status.phone, db.status.hash, x.code, fun _ db -> db, Terminate)
         | Choice2Of2 e -> db, TerminateWithError e
 
     let getChatId = function
@@ -102,8 +109,7 @@ module Domain =
                             |> Option.ofNullable
                             |> Option.bind ^ fun id -> Map.tryFind id users
                             |> Option.map ^ fun x -> sprintf "%s %s (%i)" x.FirstName x.LastName x.Id
-                            |> Option.defaultValue "<no name>"
-                          uri = Uri <| sprintf "https://t.me/%s/%i" chatName x.Id }
+                            |> Option.defaultValue "<no name>" }
                     |> Seq.rev
                     |> Seq.toList
                 { db with history = Map.add chatName history db.history }, Terminate
@@ -122,63 +128,60 @@ module Domain =
             |> fun r -> db, ResolveUsernamRequest (r, onChatResolved)
 
 module ServerDomain =
-    let resetClient r =
-        (fun db -> sprintf "IsAuthorized: %b" db.status.authorized |> Text.Encoding.UTF8.GetBytes), 
-        Domain.resetClient r
+    type ServerEff = 
+        { action : Global -> Global * Eff
+          query : Global -> byte[] }
 
-    let getHistory (uri : string) =
+    let resetClient r =
+        { action = Domain.resetClient r
+          query = fun db -> sprintf "IsAuthorized: %b" db.status.authorized |> Text.Encoding.UTF8.GetBytes }
+    let setCode r = 
+        { action = Domain.login r
+          query = fun _ -> [||] }
+    let getHistory (chat : string) =
         let getHistoryFromDb db =
-            match Domain.getChatId uri with
+            match Domain.getChatId chat with
             | Error e -> failwith e
             | Ok chatName -> 
                 Map.tryFind chatName db.history 
                 |> Option.defaultValue []
                 |> List.toArray
                 |> Suave.Json.toJson
-        getHistoryFromDb, (Domain.getHistory uri)
+        { action = Domain.getHistory chat
+          query = getHistoryFromDb }
 
 module Interpretator =
-    let state = ref Global.empty
+    let private state = ref Global.empty
+    let update (f : Global -> Global) = state := f !state
 
-    let rec invoke terminate f =
-        let client () = match (!state).client with RealClient (_,_,f) -> f.Value | NoneClient -> failwith "no client"
+    let rec invoke (serEff : ServerDomain.ServerEff) =
+        let runClientEff f e = async {
+            let client = match (!state).client with RealClient (_,_,f) -> f.Value | NoneClient -> failwith "no client"
+            let! r = e client
+            let (db', eff') = f r !state
+            state := db'
+            return! invoke { serEff with action = fun db -> db, eff' } }
         async {
-            let (newDb, eff) = f !state
+            let (newDb, eff) = serEff.action !state
             if !state = newDb 
                 then printfn "LOG :: -in-> invoke() | eff = %O | db = %O" eff newDb
                 else printfn "LOG :: -in-> invoke() | eff = %O | old = %O | new = %O" eff !state newDb
             state := newDb
             match eff with
             | ConnectEff f ->
-                let client = client()
-                do! client.ConnectAsync()
-                let (newDb, eff) = f (client.IsUserAuthorized()) !state
-                state := newDb
-                return! invoke terminate (fun db -> db, eff)
-            | SendCodeRequest (phone, f) -> 
-                let client = client()
-                let! code = client.SendCodeRequestAsync phone
-                let (a, b) = f code !state
-                state := a
-                return! invoke terminate (fun db -> db, b)
-            | MakeAuthRequest (p, h, c) -> 
-                let client = client()
-                do! client.MakeAuthAsync(p, h, c)
-                return terminate !state
+                return! runClientEff f ^ fun client -> async {
+                    do! client.ConnectAsync()    
+                    return client.IsUserAuthorized() }
+            | SendCodeRequest (phone, f) ->
+                return! runClientEff f ^ fun client -> async { return! client.SendCodeRequestAsync phone }
+            | MakeAuthRequest (p, h, c, f) ->
+                return! runClientEff f ^ fun client -> async { return! client.MakeAuthAsync(p, h, c) }
             | ResolveUsernamRequest (r, f) -> 
-                let client = client()
-                let! a = client.SendRequestAsync<TeleSharp.TL.Contacts.TLResolvedPeer>(r)
-                let (b, c) = f a !state
-                state := b
-                return! invoke terminate (fun db -> db, c)
+                return! runClientEff f ^ fun client -> async { return! client.SendRequestAsync<Contacts.TLResolvedPeer>(r) }
             | GetHistoryRequest (p, l, f) ->
-                let client = client()
-                let! a = client.GetHistoryAsync(p, limit = l)
-                let (b, c) = f a !state
-                state := b
-                return! invoke terminate (fun db -> db, c)
+                return! runClientEff f ^ fun client -> async { return! client.GetHistoryAsync(p, limit = l) }
             | Terminate -> 
-                let result = terminate !state
+                let result = serEff.query !state
                 printfn "LOG :: <-out- invoke() | state = %O | result = %O" !state result
                 return result
             | TerminateWithError e -> 
@@ -192,29 +195,28 @@ module Server =
     open Suave.Operators
 
     let start pass =
-        let reset = request ^ fun r ctx -> async {
-            let! result = ServerDomain.resetClient r ||> Interpretator.invoke
+        let runEff eff = request ^ fun r ctx -> async {
+            let! result = eff r |> Interpretator.invoke
             return! Successful.ok result ctx }
-        let setCode = request ^ fun r ctx -> async {
-            do! Domain.login r |> Interpretator.invoke ignore
-            return! Successful.NO_CONTENT ctx }
         let simleRead (uri : string) = 
             request ^ fun _ ctx -> async {
-                let! result = ServerDomain.getHistory uri ||> Interpretator.invoke
+                let! result = ServerDomain.getHistory uri |> Interpretator.invoke
                 return! Successful.ok result ctx }
             >=> Writers.setMimeType "application/json"
 
         choose [
             GET >=> pathScan "/read/%s" simleRead
-            Authentication.authenticateBasic
-                (fun (_, p) -> p = pass)
-                ^ choose [
-                    POST >=> path "/reset" >=> reset
-                    POST >=> path "/set-code" >=> setCode ] ]
+            Authentication.authenticateBasic (fun (_, p) -> p = pass) ^ choose [
+                POST >=> path "/reset" >=> runEff ServerDomain.resetClient
+                POST >=> path "/set-code" >=> runEff ServerDomain.setCode ] ]
         |> startWebServerAsync { defaultConfig with bindings = [ HttpBinding.createSimple HTTP "0.0.0.0" 8080 ] }
         |> snd
 
 [<EntryPoint>]
 let main args =
-    Server.start args.[0] |> Async.RunSynchronously
+    match args with 
+    | [| pass; appId; apiHash |] ->
+        Interpretator.update ^ fun db -> { db with status = { db.status with appId = int appId; apiHash = apiHash } }
+        Server.start pass |> Async.RunSynchronously
+    | _ -> printfn "telegram-rest <password> <appId> <apiHash>"
     0
