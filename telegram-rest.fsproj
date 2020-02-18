@@ -11,6 +11,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Prelude" Version="0.2.4" />
     <PackageReference Include="Suave" Version="2.5.6" />
     <PackageReference Include="Suave.Experimental" Version="2.5.6" />
     <PackageReference Include="TLSharp" Version="0.1.0.470" />

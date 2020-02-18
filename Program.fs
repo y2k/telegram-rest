@@ -5,36 +5,25 @@ open TeleSharp.TL
 
 [<AutoOpen>]
 module Prelude =
-    let [<Obsolete>] TODO() = failwith "???"
-    let inline flip f a b = f b a
-    let inline always x _ = x
-    let inline (^) f x = f x
-    let inline (>>-) a f = async {
-        let! x = a
-        return f x }
-    let (|Regex|_|) pattern input =
-            let m = Text.RegularExpressions.Regex.Match(input, pattern)
-            if m.Success then Some(List.tail [ for g in m.Groups -> g.Value ])
-            else None
     let inline ignoreDb f x db = db, f x
-    module Result =
-        let unwrap = function Ok x -> x | Error e -> failwith e
-        let wrap f = try f () |> Ok with e -> Error e
-    type Microsoft.FSharp.Control.AsyncBuilder with
-        member __.Bind (t : Threading.Tasks.Task<'T>, f:'T -> Async<'R>) : Async<'R> =
-            async.Bind(Async.AwaitTask t, f)
-        member __.ReturnFrom (t : Threading.Tasks.Task<'T>) : Async<'T> = 
-            async.ReturnFrom(Async.AwaitTask t)
 
-type Snapshot = { title : string; author : string }
-type TelegramClient = NoneClient | RealClient of appId : int * apiHash : string * Lazy<TLSharp.Core.TelegramClient>
-type TelegramStatus = { hash : string; phone : string; authorized : bool; appId : int; apiHash : string }
-    with static member empty = { hash = ""; phone = ""; authorized = false; appId = 0; apiHash = "" }
+module Types =
+    type Snapshot = { title : string; author : string }
+    type TelegramClient = NoneClient | RealClient of appId : int * apiHash : string * Lazy<TLSharp.Core.TelegramClient>
+        with static member unwrap client = match client with RealClient (_,_,f) -> f.Value | NoneClient -> failwith "no client"
+    type TelegramStatus = { hash : string; phone : string; appId : int; apiHash : string }
+        with static member empty = { hash = ""; phone = ""; appId = 0; apiHash = "" }
 
 type Global =
-    { client : TelegramClient
-      status : TelegramStatus }
-    with static member empty = { client = NoneClient; status = TelegramStatus.empty }
+    { client : Types.TelegramClient
+      status : Types.TelegramStatus }
+module Global =
+    let empty = { client = Types.NoneClient; status = Types.TelegramStatus.empty }
+    let state = ref empty
+    let update f = 
+        let (newState, result) = f !state
+        state := newState
+        result
 
 type Callback<'a, 't> = 'a -> Global -> Global * 't Eff
 
@@ -48,24 +37,25 @@ and 't Eff =
     | GetHistoryRequest of TLAbsInputPeer * limit : int * Callback<Messages.TLAbsMessages, 't>
 
 module Domain =
+    open Types
     open Suave.Form
     open TLSharp.Core
     open TeleSharp.TL.Contacts
 
-    let resetClient r db =
-        let onConnected phone (isAuthorized : bool) db =
-            let onTokenReceived hash db = 
-                { db with status = { db.status with hash = hash; phone = phone } }, Terminate "Waiting for code"
-            if isAuthorized 
-                then { db with status = { db.status with authorized = isAuthorized } }, Terminate "Already authorized"
-                else { db with status = { db.status with authorized = isAuthorized } }, SendCodeRequest (phone, onTokenReceived)
+    let onConnected phone (isAuthorized : bool) =
+        let onTokenReceived hash db = 
+            { db with status = { db.status with hash = hash; phone = phone } }, Terminate "Waiting for code"
+        if isAuthorized 
+            then Terminate "Already authorized"
+            else SendCodeRequest (phone, onTokenReceived)
 
+    let resetClient r db =
         let formDesc : Form<{| phone : string |}> =
             Form ([ TextProp ((fun f -> <@ f.phone @>), [ maxLength 32 ]) ], [])
         match bindForm formDesc r with 
         | Choice1Of2 x ->
             { db with client = RealClient (db.status.appId, db.status.apiHash, lazy(new TelegramClient(db.status.appId, db.status.apiHash))) }, 
-            ConnectEff ^ onConnected x.phone
+            ConnectEff ^ ignoreDb (onConnected x.phone)
         | Choice2Of2 e -> db, TerminateWithError e
 
     let login r db =
@@ -127,22 +117,22 @@ module Domain =
                |> fun r -> ResolveUsernamRequest (r, ignoreDb onChatResolved)
 
 module Interpretator =
-    let private state = ref Global.empty
-    let update (f : Global -> Global) = state := f !state
+    open Types
 
-    let rec invoke (serEffFunc : Global -> Global * string Eff) : string Async =
-        let runClientEff f e = async {
-            let client = match (!state).client with RealClient (_,_,f) -> f.Value | NoneClient -> failwith "no client"
-            let! r = e client
-            let (db', eff') = f r !state
-            state := db'
-            return! invoke (fun db -> db, eff') }
+    let rec invoke (update: Global -> Global * string Eff) : string Async =
+        let runClientEff f e = 
+            async {
+                let client = (!Global.state).client |> TelegramClient.unwrap
+                let! r = e client
+                let newEff = Global.update ^ fun db -> f r db
+                return! invoke (fun db -> db, newEff) 
+            }
         async {
-            let (newDb, eff) = serEffFunc !state
-            if !state = newDb 
-                then printfn "LOG :: -in-> invoke() | eff = %O | db = %O" eff newDb
-                else printfn "LOG :: -in-> invoke() | eff = %O | old = %O | new = %O" eff !state newDb
-            state := newDb
+            let oldState = !Global.state
+            let eff = Global.update update
+            if !Global.state = oldState 
+                then printfn "LOG :: -in-> invoke() | eff = %O | db = %O" eff oldState
+                else printfn "LOG :: -in-> invoke() | eff = %O | old = %O | new = %O" eff oldState !Global.state
             match eff with
             | ConnectEff f ->
                 return! runClientEff f ^ fun client -> async {
@@ -157,10 +147,10 @@ module Interpretator =
             | GetHistoryRequest (p, l, f) ->
                 return! runClientEff f ^ fun client -> async { return! client.GetHistoryAsync(p, limit = l) }
             | Terminate result -> 
-                printfn "LOG :: <-out- invoke() | state = %O | result = %O" !state result
+                printfn "LOG :: <-out- invoke() | state = %O | result = %O" !Global.state result
                 return result
             | TerminateWithError e -> 
-                eprintfn "LOG :: ERROR :: <-e:out- invoke() | state = %O | result = %s" !state e
+                eprintfn "LOG :: ERROR :: <-e:out- invoke() | state = %O | result = %s" !Global.state e
                 return failwith e
         }
 
@@ -187,7 +177,7 @@ module Server =
 let main args =
     match args with 
     | [| pass; appId; apiHash |] ->
-        Interpretator.update ^ fun db -> { db with status = { db.status with appId = int appId; apiHash = apiHash } }
+        Global.update ^ fun db -> { db with status = { db.status with appId = int appId; apiHash = apiHash } }, ()
         Server.start pass |> Async.RunSynchronously
     | _ -> printfn "telegram-rest <password> <appId> <apiHash>"
     0
