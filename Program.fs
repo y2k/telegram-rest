@@ -89,14 +89,11 @@ module Domain =
 
     let onChatResolved (response : TLResolvedPeer) =
         if Seq.isEmpty response.Chats 
-            then Error ^ sprintf "Can't find chat in %O" response
+            then TerminateWithError ^ sprintf "Can't find chat in %O" response
             else
                 let channel = response.Chats.[0] :?> TLChannel
-                TLInputPeerChannel(ChannelId = channel.Id, AccessHash = channel.AccessHash.Value)
-                |> Ok
-        |> function
-           | Ok r -> GetHistoryRequest(r, 50, ignoreDb onMessagesLoaded)
-           | Error e -> TerminateWithError e
+                let ch = TLInputPeerChannel(ChannelId = channel.Id, AccessHash = channel.AccessHash.Value)
+                GetHistoryRequest(ch, 50, ignoreDb onMessagesLoaded)
 
     let getHistory (r : Suave.Http.HttpRequest) =
         r.queryParamOpt "chat"
@@ -105,9 +102,8 @@ module Domain =
         |> Result.bind getChatId
         |> function
            | Error e -> TerminateWithError e
-           | Ok chatName -> 
-               TLRequestResolveUsername(Username = chatName)
-               |> fun r -> ResolveUsernamRequest (r, ignoreDb onChatResolved)
+           | Ok name -> 
+               ResolveUsernamRequest (TLRequestResolveUsername(Username = name), ignoreDb onChatResolved)
 
 module Interpretator =
     open Types
