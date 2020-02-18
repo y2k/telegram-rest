@@ -16,6 +16,7 @@ module Prelude =
             let m = Text.RegularExpressions.Regex.Match(input, pattern)
             if m.Success then Some(List.tail [ for g in m.Groups -> g.Value ])
             else None
+    let inline ignoreDb f x db = db, f x
     module Result =
         let unwrap = function Ok x -> x | Error e -> failwith e
         let wrap f = try f () |> Ok with e -> Error e
@@ -51,7 +52,7 @@ module Domain =
     open TLSharp.Core
     open TeleSharp.TL.Contacts
 
-    let resetClient r (db : Global) =
+    let resetClient r db =
         let onConnected phone (isAuthorized : bool) db =
             let onTokenReceived hash db = 
                 { db with status = { db.status with hash = hash; phone = phone } }, Terminate "Waiting for code"
@@ -67,7 +68,7 @@ module Domain =
             ConnectEff ^ onConnected x.phone
         | Choice2Of2 e -> db, TerminateWithError e
 
-    let login r (db : Global) =
+    let login r db =
         let formDesc : Form<{| code : string |}> =
             Form ([ TextProp ((fun f -> <@ f.code @>), [ maxLength 8 ]) ], [])
         match bindForm formDesc r  with
@@ -79,7 +80,7 @@ module Domain =
         | Regex "^([\\w\\d_]+)$" [ id ] -> Ok id
         | origin -> Error ^ sprintf "Can't find valid id from %s" origin
 
-    let onMessagesLoaded (messages : Messages.TLAbsMessages) db =
+    let onMessagesLoaded (messages : Messages.TLAbsMessages) =
         let channelMessages = (messages :?> Messages.TLChannelMessages)
         let users =
             channelMessages.Users
@@ -101,9 +102,9 @@ module Domain =
             |> Seq.toArray
             |> Suave.Json.toJson
             |> System.Text.Encoding.UTF8.GetString
-        db, Terminate history
+        Terminate history
 
-    let onChatResolved (response : TLResolvedPeer) db =
+    let onChatResolved (response : TLResolvedPeer) =
         if Seq.isEmpty response.Chats 
             then Error ^ sprintf "Can't find chat in %O" response
             else
@@ -111,19 +112,19 @@ module Domain =
                 TLInputPeerChannel(ChannelId = channel.Id, AccessHash = channel.AccessHash.Value)
                 |> Ok
         |> function
-           | Ok r -> db, GetHistoryRequest(r, 50, onMessagesLoaded)
-           | Error e -> db, TerminateWithError e
+           | Ok r -> GetHistoryRequest(r, 50, ignoreDb onMessagesLoaded)
+           | Error e -> TerminateWithError e
 
-    let getHistory (r : Suave.Http.HttpRequest) (db : Global) =
+    let getHistory (r : Suave.Http.HttpRequest) =
         r.queryParamOpt "chat"
         |> Option.bind snd
         |> Result.ofOption "No parameter <chat>"
         |> Result.bind getChatId
         |> function
-           | Error e -> db, TerminateWithError e
+           | Error e -> TerminateWithError e
            | Ok chatName -> 
                TLRequestResolveUsername(Username = chatName)
-               |> fun r -> db, ResolveUsernamRequest (r, onChatResolved)
+               |> fun r -> ResolveUsernamRequest (r, ignoreDb onChatResolved)
 
 module Interpretator =
     let private state = ref Global.empty
@@ -175,7 +176,7 @@ module Server =
                 return! Successful.OK result ctx }
             >=> Writers.setMimeType "application/json"
         choose [
-            GET >=> path "/history" >=> runEff Domain.getHistory
+            GET >=> path "/history" >=> runEff ^ ignoreDb Domain.getHistory
             Authentication.authenticateBasic (fun (_, p) -> p = pass) ^ choose [
                 POST >=> path "/reset" >=> runEff Domain.resetClient
                 POST >=> path "/set-code" >=> runEff Domain.login ] ]
