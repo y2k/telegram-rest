@@ -13,19 +13,12 @@ module Types =
         with static member unwrap client = match client with RealClient (_,_,f) -> f.Value | NoneClient -> failwith "no client"
     type TelegramStatus = { hash : string; phone : string; appId : int; apiHash : string }
         with static member empty = { hash = ""; phone = ""; appId = 0; apiHash = "" }
+    type Global = { client : TelegramClient; status : TelegramStatus }
+        with static member empty = { client = NoneClient; status = TelegramStatus.empty }
 
-type Global =
-    { client : Types.TelegramClient
-      status : Types.TelegramStatus }
-module Global =
-    let empty = { client = Types.NoneClient; status = Types.TelegramStatus.empty }
-    let state = ref empty
-    let update f = 
-        let (newState, result) = f !state
-        state := newState
-        result
+let Global = Atom.atom Types.Global.empty
 
-type Callback<'a, 't> = 'a -> Global -> Global * 't Eff
+type Callback<'a, 't> = 'a -> Types.Global -> Types.Global * 't Eff
 
 and 't Eff =
     | Terminate of 't
@@ -122,17 +115,17 @@ module Interpretator =
     let rec invoke (update: Global -> Global * string Eff) : string Async =
         let runClientEff f e = 
             async {
-                let client = (!Global.state).client |> TelegramClient.unwrap
+                let client = (Global.Value).client |> TelegramClient.unwrap
                 let! r = e client
-                let newEff = Global.update ^ fun db -> f r db
+                let newEff = Global.dispatch ^ fun db -> f r db
                 return! invoke (fun db -> db, newEff) 
             }
         async {
-            let oldState = !Global.state
-            let eff = Global.update update
-            if !Global.state = oldState 
+            let oldState = Global.Value
+            let eff = Global.dispatch update
+            if Global.Value = oldState 
                 then printfn "LOG :: -in-> invoke() | eff = %O | db = %O" eff oldState
-                else printfn "LOG :: -in-> invoke() | eff = %O | old = %O | new = %O" eff oldState !Global.state
+                else printfn "LOG :: -in-> invoke() | eff = %O | old = %O | new = %O" eff oldState Global.Value
             match eff with
             | ConnectEff f ->
                 return! runClientEff f ^ fun client -> async {
@@ -147,10 +140,10 @@ module Interpretator =
             | GetHistoryRequest (p, l, f) ->
                 return! runClientEff f ^ fun client -> async { return! client.GetHistoryAsync(p, limit = l) }
             | Terminate result -> 
-                printfn "LOG :: <-out- invoke() | state = %O | result = %O" !Global.state result
+                printfn "LOG :: <-out- invoke() | state = %O | result = %O" Global.Value result
                 return result
             | TerminateWithError e -> 
-                eprintfn "LOG :: ERROR :: <-e:out- invoke() | state = %O | result = %s" !Global.state e
+                eprintfn "LOG :: ERROR :: <-e:out- invoke() | state = %O | result = %s" Global.Value e
                 return failwith e
         }
 
@@ -165,11 +158,11 @@ module Server =
                 let! result = eff r |> Interpretator.invoke
                 return! Successful.OK result ctx }
             >=> Writers.setMimeType "application/json"
-        choose [
+
+        Authentication.authenticateBasic (fun (_, p) -> p = pass) ^ choose [
             GET >=> path "/history" >=> runEff ^ ignoreDb Domain.getHistory
-            Authentication.authenticateBasic (fun (_, p) -> p = pass) ^ choose [
-                POST >=> path "/reset" >=> runEff Domain.resetClient
-                POST >=> path "/set-code" >=> runEff Domain.login ] ]
+            POST >=> path "/reset" >=> runEff Domain.resetClient
+            POST >=> path "/set-code" >=> runEff Domain.login ]
         |> startWebServerAsync { defaultConfig with bindings = [ HttpBinding.createSimple HTTP "0.0.0.0" 8080 ] }
         |> snd
 
@@ -177,7 +170,7 @@ module Server =
 let main args =
     match args with 
     | [| pass; appId; apiHash |] ->
-        Global.update ^ fun db -> { db with status = { db.status with appId = int appId; apiHash = apiHash } }, ()
+        Global.update ^ fun db -> { db with status = { db.status with appId = int appId; apiHash = apiHash } }
         Server.start pass |> Async.RunSynchronously
     | _ -> printfn "telegram-rest <password> <appId> <apiHash>"
     0
