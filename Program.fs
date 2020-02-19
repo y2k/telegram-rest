@@ -11,12 +11,73 @@ module Types =
     type Snapshot = { title : string; author : string }
     type TelegramClient = NoneClient | RealClient of appId : int * apiHash : string * Lazy<TLSharp.Core.TelegramClient>
         with static member unwrap client = match client with RealClient (_,_,f) -> f.Value | NoneClient -> failwith "no client"
+             static member create appId apiHash = RealClient (appId, apiHash, lazy(new TLSharp.Core.TelegramClient(appId, apiHash)))
     type TelegramStatus = { hash : string; phone : string; appId : int; apiHash : string }
         with static member empty = { hash = ""; phone = ""; appId = 0; apiHash = "" }
     type Global = { client : TelegramClient; status : TelegramStatus }
         with static member empty = { client = NoneClient; status = TelegramStatus.empty }
 
 let Global = Atom.atom Types.Global.empty
+
+module Domain' =
+    open Types
+    open Suave.Form
+    open TeleSharp.TL.Contacts
+
+    let toSnapshots (messages : Messages.TLAbsMessages) =
+        let channelMessages = (messages :?> Messages.TLChannelMessages)
+        let users =
+            channelMessages.Users
+            |> Seq.map ^ fun x -> x :?> TLUser
+            |> Seq.map ^ fun x -> x.Id, x
+            |> Map.ofSeq
+        channelMessages.Messages
+        |> Seq.choose ^ function | :? TLMessage as x -> Some x | _ -> None
+        |> Seq.map ^ fun x ->
+            { title = x.Message
+              author = 
+                x.FromId
+                |> Option.ofNullable
+                |> Option.bind ^ fun id -> Map.tryFind id users
+                |> Option.map ^ fun x -> sprintf "%s %s (%i)" x.FirstName x.LastName x.Id
+                |> Option.defaultValue "<no name>" }
+        |> Seq.rev
+        |> Seq.toArray
+
+    let getChatId = function
+        | Regex "^https://t.me/([\\w\\d_]+)$" [ id ] -> Ok id
+        | Regex "^([\\w\\d_]+)$" [ id ] -> Ok id
+        | origin -> Error ^ sprintf "Can't find valid id from %s" origin
+
+    let parseChat (r : Suave.Http.HttpRequest) =
+        r.queryParamOpt "chat"
+        |> Option.bind snd
+        |> Result.ofOption "No parameter <chat>"
+        |> Result.bind getChatId
+
+    let parseCode r =
+        let formDesc : Form<{| code : string |}> =
+            Form ([ TextProp ((fun f -> <@ f.code @>), [ maxLength 8 ]) ], [])
+        bindForm formDesc r
+
+    let parsePhone r =
+        let formDesc : Form<{| phone : string |}> =
+            Form ([ TextProp ((fun f -> <@ f.phone @>), [ maxLength 32 ]) ], [])
+        bindForm formDesc r
+
+    let toInputPeerChannel (response : TLResolvedPeer) =
+        let channel = response.Chats.[0] :?> TLChannel
+        TLInputPeerChannel(ChannelId = channel.Id, AccessHash = channel.AccessHash.Value)
+
+module ResponseDomain =
+    let waitingForCode = "Waiting for code"
+    let alreadyAuthorized = "Already authorized"
+    let cantFindChat x = sprintf "Can't find chat in %O" x
+    let successAuthorized = "Success authorized"
+    let toJsonResponse messages =
+        messages
+        |> Suave.Json.toJson
+        |> Text.Encoding.UTF8.GetString
 
 type Callback<'a, 't> = 'a -> Types.Global -> Types.Global * 't Eff
 
@@ -31,79 +92,49 @@ and 't Eff =
 
 module Domain =
     open Types
+    open Domain'
     open Suave.Form
     open TLSharp.Core
     open TeleSharp.TL.Contacts
 
-    let onConnected phone (isAuthorized : bool) =
-        let onTokenReceived hash db = 
-            { db with status = { db.status with hash = hash; phone = phone } }, Terminate "Waiting for code"
-        if isAuthorized 
-            then Terminate "Already authorized"
-            else SendCodeRequest (phone, onTokenReceived)
+    let onTokenReceived phone hash db = 
+        { db with status = { db.status with hash = hash; phone = phone } }, 
+        Terminate ResponseDomain.waitingForCode
+
+    let onConnected phone isAuthorized =
+        match isAuthorized with
+        | true -> Terminate ResponseDomain.alreadyAuthorized
+        | false -> SendCodeRequest (phone, onTokenReceived phone)
 
     let resetClient r db =
-        let formDesc : Form<{| phone : string |}> =
-            Form ([ TextProp ((fun f -> <@ f.phone @>), [ maxLength 32 ]) ], [])
-        match bindForm formDesc r with 
+        match parsePhone r with 
         | Choice1Of2 x ->
-            { db with client = RealClient (db.status.appId, db.status.apiHash, lazy(new TelegramClient(db.status.appId, db.status.apiHash))) }, 
+            { db with client = TelegramClient.create db.status.appId db.status.apiHash }, 
             ConnectEff ^ ignoreDb (onConnected x.phone)
         | Choice2Of2 e -> db, TerminateWithError e
 
     let login r db =
-        let formDesc : Form<{| code : string |}> =
-            Form ([ TextProp ((fun f -> <@ f.code @>), [ maxLength 8 ]) ], [])
-        match bindForm formDesc r  with
-        | Choice1Of2 x -> db, MakeAuthRequest (db.status.phone, db.status.hash, x.code, fun _ db -> db, Terminate "Success authorized")
+        match parseCode r with
+        | Choice1Of2 x -> db, MakeAuthRequest (db.status.phone, db.status.hash, x.code, fun _ db -> db, Terminate ResponseDomain.successAuthorized)
         | Choice2Of2 e -> db, TerminateWithError e
 
-    let getChatId = function
-        | Regex "^https://t.me/([\\w\\d_]+)$" [ id ] -> Ok id
-        | Regex "^([\\w\\d_]+)$" [ id ] -> Ok id
-        | origin -> Error ^ sprintf "Can't find valid id from %s" origin
-
-    let onMessagesLoaded (messages : Messages.TLAbsMessages) =
-        let channelMessages = (messages :?> Messages.TLChannelMessages)
-        let users =
-            channelMessages.Users
-            |> Seq.map ^ fun x -> x :?> TLUser
-            |> Seq.map ^ fun x -> x.Id, x
-            |> Map.ofSeq
-        let history =
-            channelMessages.Messages
-            |> Seq.choose ^ function | :? TLMessage as x -> Some x | _ -> None
-            |> Seq.map ^ fun x ->
-                { title = x.Message
-                  author = 
-                    x.FromId
-                    |> Option.ofNullable
-                    |> Option.bind ^ fun id -> Map.tryFind id users
-                    |> Option.map ^ fun x -> sprintf "%s %s (%i)" x.FirstName x.LastName x.Id
-                    |> Option.defaultValue "<no name>" }
-            |> Seq.rev
-            |> Seq.toArray
-            |> Suave.Json.toJson
-            |> System.Text.Encoding.UTF8.GetString
-        Terminate history
+    let onMessagesLoaded messages =
+        toSnapshots messages
+        |> ResponseDomain.toJsonResponse
+        |> Terminate 
 
     let onChatResolved (response : TLResolvedPeer) =
-        if Seq.isEmpty response.Chats 
-            then TerminateWithError ^ sprintf "Can't find chat in %O" response
-            else
-                let channel = response.Chats.[0] :?> TLChannel
-                let ch = TLInputPeerChannel(ChannelId = channel.Id, AccessHash = channel.AccessHash.Value)
-                GetHistoryRequest(ch, 50, ignoreDb onMessagesLoaded)
+        match Seq.isEmpty response.Chats with
+        | true -> TerminateWithError ^ ResponseDomain.cantFindChat response
+        | false ->
+            let ch = toInputPeerChannel response
+            GetHistoryRequest(ch, 50, ignoreDb onMessagesLoaded)
 
     let getHistory (r : Suave.Http.HttpRequest) =
-        r.queryParamOpt "chat"
-        |> Option.bind snd
-        |> Result.ofOption "No parameter <chat>"
-        |> Result.bind getChatId
-        |> function
-           | Error e -> TerminateWithError e
-           | Ok name -> 
-               ResolveUsernamRequest (TLRequestResolveUsername(Username = name), ignoreDb onChatResolved)
+        match parseChat r with
+        | Error e -> TerminateWithError e
+        | Ok name -> 
+            ResolveUsernamRequest (TLRequestResolveUsername(Username = name), ignoreDb onChatResolved)
 
 module Interpretator =
     open Types
