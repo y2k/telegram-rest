@@ -90,6 +90,14 @@ and 't Eff =
     | ResolveUsernamRequest of Contacts.TLRequestResolveUsername * Callback<Contacts.TLResolvedPeer, 't>
     | GetHistoryRequest of TLAbsInputPeer * limit : int * Callback<Messages.TLAbsMessages, 't>
 
+type IEffect =
+    abstract member invoke : unit Async
+
+type MakeAuthRequest' =
+    { phone : string; hash : string; code : string }
+    interface IEffect with
+        member __.invoke = TODO()
+
 module Domain =
     open Types
     open Domain'
