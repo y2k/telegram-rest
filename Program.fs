@@ -1,7 +1,89 @@
 ﻿module TelegramRest
 
+module Foo' =
+    type RawMessages = RawMessages
+    type Model = Model
+    type TLUser = TLUser
+    type 't IEffect =
+        abstract member invoke: Async<'t>
+    
+    type 't ResultEffect =
+        { result : 't }
+        interface 't IEffect with 
+            member this.invoke : Async<'t> = this.result |> async.Return
+    type 't MappedEffect =
+        { origin : obj
+          f : 't Async }
+        interface 't IEffect with
+            member this.invoke : Async<'t> = this.f
+    module Effect =
+        let lift x = { result = x } :> IEffect<_>
+        let bind (f : 'a -> _ :> 'b IEffect) (origin : 'a IEffect) : 'b IEffect =
+            let e =
+                { MappedEffect.origin = origin
+                  f = async {
+                      let! a = origin.invoke
+                      let b = f a
+                      return! b.invoke
+                  } 
+                }
+            e :> 'b IEffect
+        let map f x = bind (f >> lift) x
+
+    type ResolveName = 
+        { name : string }
+        interface TLUser IEffect with 
+            member __.invoke : Async<TLUser> = failwith "???"
+    type LoadHistory = 
+        { user : TLUser; limit : int }
+        interface RawMessages IEffect with 
+            member __.invoke : Async<RawMessages> = failwith "???"
+
+    let rawMessagesToResult (_ : RawMessages) : string = failwith "???"
+    let tryFindUserName _ : Result<_,_> = failwith "???"
+
+    let onChatHistoryRequested chat =
+        match tryFindUserName chat with
+        | Error e -> Effect.lift e
+        | Ok chat ->
+            { ResolveName.name = chat } 
+            |> Effect.bind ^ fun user -> { LoadHistory.user = user; limit = 50 }
+            |> Effect.map rawMessagesToResult
+
+    let onChatHistoryRequested'' chat : IEffect<string> =
+        let onChatResolved (user : TLUser) : IEffect<string> = 
+            let ofHistoryLoaded (message : RawMessages) : IEffect<string> = 
+                Effect.lift (string message)
+        
+            { LoadHistory.user = user; limit = 50 }
+            |> Effect.bind ofHistoryLoaded
+    
+        { ResolveName.name = chat } 
+        |> Effect.bind onChatResolved
+
+module Foo =
+    type Model = Model
+    type TLUser = TLUser
+    type IEffect =
+        abstract member invoke: Async<unit>
+    
+    type ResolveName = 
+        { user : string; next : TLUser -> Model -> Model * IEffect }
+        interface IEffect with 
+            member __.invoke : Async<unit> = failwith "???"
+    type LoadHistory = 
+        { user : TLUser; next : unit list -> Model -> Model * IEffect }
+        interface IEffect with 
+            member __.invoke : Async<unit> = failwith "???"
+
+    let doSomethingWithModel3 x = x
+    let onChatResolved (user : TLUser) (model : Model) : Model * IEffect = 
+        failwith "???"
+    let onChatHistoryRequested chat model : Model * IEffect =
+        doSomethingWithModel3 model, 
+        { user = chat; ResolveName.next = onChatResolved } :> IEffect
+
 open System
-open TeleSharp.TL
 
 [<AutoOpen>]
 module Prelude =
@@ -17,11 +99,10 @@ module Types =
     type Global = { client : TelegramClient; status : TelegramStatus }
         with static member empty = { client = NoneClient; status = TelegramStatus.empty }
 
-let Global = Atom.atom Types.Global.empty
-
-module Domain' =
+module Domain =
     open Types
     open Suave.Form
+    open TeleSharp.TL
     open TeleSharp.TL.Contacts
 
     let toSnapshots (messages : Messages.TLAbsMessages) =
@@ -79,42 +160,34 @@ module ResponseDomain =
         |> Suave.Json.toJson
         |> Text.Encoding.UTF8.GetString
 
-type Callback<'a, 't> = 'a -> Types.Global -> Types.Global * 't Eff
+let Global = Atom.atom Types.Global.empty
 
-and 't Eff =
-    | Terminate of 't
-    | TerminateWithError of string
-    | ConnectEff of Callback<bool, 't>
-    | SendCodeRequest of phone : string * Callback<string, 't>
-    | MakeAuthRequest of phone : string * hash : string * code : string * Callback<TLUser, 't>
-    | ResolveUsernamRequest of Contacts.TLRequestResolveUsername * Callback<Contacts.TLResolvedPeer, 't>
-    | GetHistoryRequest of TLAbsInputPeer * limit : int * Callback<Messages.TLAbsMessages, 't>
-
-type IEffect =
-    abstract member invoke : unit Async
-
-type MakeAuthRequest' =
-    { phone : string; hash : string; code : string }
-    interface IEffect with
-        member __.invoke = TODO()
-
-module Domain =
+module Services =
     open Types
-    open Domain'
-    open Suave.Form
-    open TLSharp.Core
+    open Domain
+    open TeleSharp.TL
     open TeleSharp.TL.Contacts
 
-    let onTokenReceived phone hash db = 
-        { db with status = { db.status with hash = hash; phone = phone } }, 
-        Terminate ResponseDomain.waitingForCode
-
-    let onConnected phone isAuthorized =
-        match isAuthorized with
-        | true -> Terminate ResponseDomain.alreadyAuthorized
-        | false -> SendCodeRequest (phone, onTokenReceived phone)
+    type Callback<'a, 't> = 'a -> Types.Global -> Types.Global * 't Command
+    and 't Command =
+        | Terminate of 't
+        | TerminateWithError of string
+        | ConnectEff of Callback<bool, 't>
+        | SendCodeRequest of phone : string * Callback<string, 't>
+        | MakeAuthRequest of phone : string * hash : string * code : string * Callback<TLUser, 't>
+        | ResolveUsernamRequest of TLRequestResolveUsername * Callback<TLResolvedPeer, 't>
+        | GetHistoryRequest of TLAbsInputPeer * limit : int * Callback<Messages.TLAbsMessages, 't>
 
     let resetClient r db =
+        let onConnected phone isAuthorized =
+            let onTokenReceived phone hash db = 
+                { db with status = { db.status with hash = hash; phone = phone } }, 
+                Terminate ResponseDomain.waitingForCode
+        
+            match isAuthorized with
+            | true -> Terminate ResponseDomain.alreadyAuthorized
+            | false -> SendCodeRequest (phone, onTokenReceived phone)
+    
         match parsePhone r with 
         | Choice1Of2 x ->
             { db with client = TelegramClient.create db.status.appId db.status.apiHash }, 
@@ -126,61 +199,59 @@ module Domain =
         | Choice1Of2 x -> db, MakeAuthRequest (db.status.phone, db.status.hash, x.code, fun _ db -> db, Terminate ResponseDomain.successAuthorized)
         | Choice2Of2 e -> db, TerminateWithError e
 
-    let onMessagesLoaded messages =
-        toSnapshots messages
-        |> ResponseDomain.toJsonResponse
-        |> Terminate 
+    let getHistory r =
+        let onChatResolved (response : TLResolvedPeer) =
+            let onMessagesLoaded messages =
+                toSnapshots messages
+                |> ResponseDomain.toJsonResponse
+                |> Terminate 
+        
+            match Seq.isEmpty response.Chats with
+            | true -> TerminateWithError ^ ResponseDomain.cantFindChat response
+            | false ->
+                let ch = toInputPeerChannel response
+                GetHistoryRequest(ch, 50, ignoreDb onMessagesLoaded)
 
-    let onChatResolved (response : TLResolvedPeer) =
-        match Seq.isEmpty response.Chats with
-        | true -> TerminateWithError ^ ResponseDomain.cantFindChat response
-        | false ->
-            let ch = toInputPeerChannel response
-            GetHistoryRequest(ch, 50, ignoreDb onMessagesLoaded)
-
-    let getHistory (r : Suave.Http.HttpRequest) =
         match parseChat r with
         | Error e -> TerminateWithError e
         | Ok name -> 
             ResolveUsernamRequest (TLRequestResolveUsername(Username = name), ignoreDb onChatResolved)
 
-module Interpretator =
-    open Types
-
-    let rec invoke (update: Global -> Global * string Eff) : string Async =
-        let runClientEff f e = 
+    module Interpretator =
+        let rec invoke (update : Global -> Global * 'a Command) : 'a Async =
+            let runClientEff f e = 
+                async {
+                    let client = (Global.Value).client |> TelegramClient.unwrap
+                    let! r = e client
+                    let newEff = Global.dispatch ^ fun db -> f r db
+                    return! invoke (fun db -> db, newEff) 
+                }
             async {
-                let client = (Global.Value).client |> TelegramClient.unwrap
-                let! r = e client
-                let newEff = Global.dispatch ^ fun db -> f r db
-                return! invoke (fun db -> db, newEff) 
+                let oldState = Global.Value
+                let eff = Global.dispatch update
+                if Global.Value = oldState 
+                    then printfn "LOG :: -in-> invoke() | eff = %O | db = %O" eff oldState
+                    else printfn "LOG :: -in-> invoke() | eff = %O | old = %O | new = %O" eff oldState Global.Value
+                match eff with
+                | ConnectEff f ->
+                    return! runClientEff f ^ fun client -> async {
+                        do! client.ConnectAsync()    
+                        return client.IsUserAuthorized() }
+                | SendCodeRequest (phone, f) ->
+                    return! runClientEff f ^ fun client -> async { return! client.SendCodeRequestAsync phone }
+                | MakeAuthRequest (p, h, c, f) ->
+                    return! runClientEff f ^ fun client -> async { return! client.MakeAuthAsync(p, h, c) }
+                | ResolveUsernamRequest (r, f) -> 
+                    return! runClientEff f ^ fun client -> async { return! client.SendRequestAsync<Contacts.TLResolvedPeer>(r) }
+                | GetHistoryRequest (p, l, f) ->
+                    return! runClientEff f ^ fun client -> async { return! client.GetHistoryAsync(p, limit = l) }
+                | Terminate result -> 
+                    printfn "LOG :: <-out- invoke() | state = %O | result = %O" Global.Value result
+                    return result
+                | TerminateWithError e -> 
+                    eprintfn "LOG :: ERROR :: <-e:out- invoke() | state = %O | result = %s" Global.Value e
+                    return failwith e
             }
-        async {
-            let oldState = Global.Value
-            let eff = Global.dispatch update
-            if Global.Value = oldState 
-                then printfn "LOG :: -in-> invoke() | eff = %O | db = %O" eff oldState
-                else printfn "LOG :: -in-> invoke() | eff = %O | old = %O | new = %O" eff oldState Global.Value
-            match eff with
-            | ConnectEff f ->
-                return! runClientEff f ^ fun client -> async {
-                    do! client.ConnectAsync()    
-                    return client.IsUserAuthorized() }
-            | SendCodeRequest (phone, f) ->
-                return! runClientEff f ^ fun client -> async { return! client.SendCodeRequestAsync phone }
-            | MakeAuthRequest (p, h, c, f) ->
-                return! runClientEff f ^ fun client -> async { return! client.MakeAuthAsync(p, h, c) }
-            | ResolveUsernamRequest (r, f) -> 
-                return! runClientEff f ^ fun client -> async { return! client.SendRequestAsync<Contacts.TLResolvedPeer>(r) }
-            | GetHistoryRequest (p, l, f) ->
-                return! runClientEff f ^ fun client -> async { return! client.GetHistoryAsync(p, limit = l) }
-            | Terminate result -> 
-                printfn "LOG :: <-out- invoke() | state = %O | result = %O" Global.Value result
-                return result
-            | TerminateWithError e -> 
-                eprintfn "LOG :: ERROR :: <-e:out- invoke() | state = %O | result = %s" Global.Value e
-                return failwith e
-        }
 
 module Server =
     open Suave
@@ -190,14 +261,14 @@ module Server =
     let start pass =
         let runEff eff = 
             request ^ fun r ctx -> async {
-                let! result = eff r |> Interpretator.invoke
+                let! result = eff r |> Services.Interpretator.invoke
                 return! Successful.OK result ctx }
             >=> Writers.setMimeType "application/json"
 
         Authentication.authenticateBasic (fun (_, p) -> p = pass) ^ choose [
-            GET >=> path "/history" >=> runEff ^ ignoreDb Domain.getHistory
-            POST >=> path "/reset" >=> runEff Domain.resetClient
-            POST >=> path "/set-code" >=> runEff Domain.login ]
+            GET >=> path "/history" >=> runEff ^ ignoreDb Services.getHistory
+            POST >=> path "/reset" >=> runEff Services.resetClient
+            POST >=> path "/set-code" >=> runEff Services.login ]
         |> startWebServerAsync { defaultConfig with bindings = [ HttpBinding.createSimple HTTP "0.0.0.0" 8080 ] }
         |> snd
 
