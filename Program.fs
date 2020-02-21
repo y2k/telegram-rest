@@ -178,6 +178,31 @@ module Services =
         | ResolveUsernamRequest of TLRequestResolveUsername * Callback<TLResolvedPeer, 't>
         | GetHistoryRequest of TLAbsInputPeer * limit : int * Callback<Messages.TLAbsMessages, 't>
 
+    module Test =
+        type 't Cmd =
+            | ConnectEff of (bool -> 't)
+            | SendCodeRequest of phone : string * (string -> 't)
+            | MakeAuthRequest of phone : string * hash : string * code : string * (TLUser -> 't)
+            | ResolveUsernamRequest of TLRequestResolveUsername * (TLResolvedPeer -> 't)
+            | GetHistoryRequest of TLAbsInputPeer * limit : int * (Messages.TLAbsMessages -> 't)
+        type 't Step =
+            | Terminate of 't
+            | Next of 't Step Cmd
+    
+        let onTokenReceived (phone : string) (hash : string) =
+            // { db with status = { db.status with hash = hash; phone = phone } }, 
+            Terminate ResponseDomain.waitingForCode
+        let onConnected (phone : string) isAuthorized =
+            match isAuthorized with
+            | true -> Terminate ResponseDomain.alreadyAuthorized
+            | false -> Next (SendCodeRequest (phone, onTokenReceived phone))
+        let resetClient r db =
+            match parsePhone r with 
+            | Choice1Of2 x ->
+                // { db with client = TelegramClient.create db.status.appId db.status.apiHash }, 
+                Next (ConnectEff (onConnected x.phone))
+            | Choice2Of2 e -> Terminate (string e)
+        
     let resetClient r db =
         let onConnected phone isAuthorized =
             let onTokenReceived phone hash db = 
