@@ -7,7 +7,7 @@ module Prelude =
     let inline ignoreDb f x db = db, f x
 
 module Types =
-    type Snapshot = { title : string; author : string }
+    type Snapshot = { title : string; author : string; id : string }
     type TelegramClient = NoneClient | RealClient of appId : int * apiHash : string * Lazy<TLSharp.Core.TelegramClient>
         with static member unwrap client = match client with RealClient (_,_,f) -> f.Value | NoneClient -> failwith "no client"
              static member create appId apiHash = RealClient (appId, apiHash, lazy(new TLSharp.Core.TelegramClient(appId, apiHash)))
@@ -32,7 +32,8 @@ module Domain =
         channelMessages.Messages
         |> Seq.choose ^ function | :? TLMessage as x -> Some x | _ -> None
         |> Seq.map ^ fun x ->
-            { title = x.Message
+            { id = string x.Id
+              title = x.Message
               author = 
                 x.FromId
                 |> Option.ofNullable
