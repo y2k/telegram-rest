@@ -54,21 +54,16 @@ module Domain =
         |> Result.ofOption "No parameter <chat>"
         |> Result.bind getChatId
 
-    let parseCode r =
-        let formDesc : Form<{| code : string |}> =
-            Form ([ TextProp ((fun f -> <@ f.code @>), [ maxLength 8 ]) ], [])
-        bindForm formDesc r
-
-    let parsePhone r =
-        let formDesc : Form<{| phone : string |}> =
-            Form ([ TextProp ((fun f -> <@ f.phone @>), [ maxLength 32 ]) ], [])
-        bindForm formDesc r
+    let parseString len r =
+        let formDesc : Form<{| value : string |}> =
+            Form ([ TextProp ((fun f -> <@ f.value @>), [ maxLength len ]) ], [])
+        bindForm formDesc r |> Choice.map (fun x -> x.value) |> Result.ofChoice
 
     let toInputPeerChannel (response : TLResolvedPeer) =
         let channel = response.Chats.[0] :?> TLChannel
         TLInputPeerChannel(ChannelId = channel.Id, AccessHash = channel.AccessHash.Value)
 
-module ResponseDomain =
+module ResponseMessages =
     let waitingForCode = "Waiting for code"
     let alreadyAuthorized = "Already authorized"
     let cantFindChat x = sprintf "Can't find chat in %O" x
@@ -84,46 +79,48 @@ module Services =
     open TeleSharp.TL
     open TeleSharp.TL.Contacts
 
-    type 't Command =
+    type 't Cmd =
         | ConnectEff of (bool -> Global -> Global * 't)
-        | SendCodeRequest of phone : string * (string -> Global -> Global * 't)
-        | MakeAuthRequest of phone : string * hash : string * code : string * (TLUser -> Global -> Global * 't)
+        | SendCodeRequest of value : string * (string -> Global -> Global * 't)
+        | MakeAuthRequest of value : string * hash : string * code : string * (TLUser -> Global -> Global * 't)
         | ResolveUsernamRequest of TLRequestResolveUsername * (TLResolvedPeer -> Global -> Global * 't)
         | GetHistoryRequest of TLAbsInputPeer * limit : int * (Messages.TLAbsMessages -> Global -> Global * 't)
     type 't Next =
         | Terminate of Result<'t, string>
-        | Next of 't Next Command
+        | Next of 't Next Cmd
 
     let resetClient r db =
         let onConnected phone isAuthorized =
             let onTokenReceived hash db = 
                 { db with status = { db.status with hash = hash } }, 
-                Terminate ^ Ok ResponseDomain.waitingForCode
+                Terminate ^ Ok ResponseMessages.waitingForCode
 
             match isAuthorized with
-            | true -> Terminate ^ Ok ResponseDomain.alreadyAuthorized
+            | true -> Terminate ^ Ok ResponseMessages.alreadyAuthorized
             | false -> Next ^ SendCodeRequest (phone, onTokenReceived)
 
-        match parsePhone r with 
-        | Choice1Of2 x ->
-            { db with status = { db.status with phone = x.phone }; client = TelegramClient.create db.status.appId db.status.apiHash }, 
-            Next ^ ConnectEff ^ ignoreDb (onConnected x.phone)
-        | Choice2Of2 e -> db, Terminate ^ Error e
+        match parseString 32 r with 
+        | Ok phone ->
+            { db with status = { db.status with phone = phone }; client = TelegramClient.create db.status.appId db.status.apiHash }, 
+            Next ^ ConnectEff ^ ignoreDb (onConnected phone)
+        | Error e -> db, Terminate ^ Error e
 
     let login r db =
-        match parseCode r with
-        | Choice1Of2 x -> db, Next ^ MakeAuthRequest (db.status.phone, db.status.hash, x.code, fun _ db -> db, Terminate ^ Ok ResponseDomain.successAuthorized)
-        | Choice2Of2 e -> db, Terminate ^ Error e
+        let onLoginEnd _ db = db, Terminate ^ Ok ResponseMessages.successAuthorized
+        db
+        , match parseString 8 r with
+          | Ok code -> Next ^ MakeAuthRequest (db.status.phone, db.status.hash, code, onLoginEnd)
+          | Error e -> Terminate ^ Error e
 
     let getHistory r =
         let onChatResolved (response : TLResolvedPeer) =
             let onMessagesLoaded messages =
                 toSnapshots messages
-                |> ResponseDomain.toJsonResponse
+                |> ResponseMessages.toJsonResponse
                 |> (Ok >> Terminate)
 
             match Seq.isEmpty response.Chats with
-            | true -> Terminate ^ Error ^ ResponseDomain.cantFindChat response
+            | true -> Terminate ^ Error ^ ResponseMessages.cantFindChat response
             | false ->
                 let ch = toInputPeerChannel response
                 Next ^ GetHistoryRequest(ch, 50, ignoreDb onMessagesLoaded)
@@ -134,16 +131,30 @@ module Services =
             Next ^ ResolveUsernamRequest (TLRequestResolveUsername(Username = name), ignoreDb onChatResolved)
 
     module Interpretator =
-        let store = Atom.atom Types.Global.empty
+        let executeEff eff (client : TLSharp.Core.TelegramClient) =
+            async {
+                match eff with
+                | ConnectEff f ->
+                    do! client.ConnectAsync()    
+                    let x = client.IsUserAuthorized() 
+                    return f x
+                | SendCodeRequest (phone, f) ->
+                    let! x = client.SendCodeRequestAsync(phone)
+                    return f x
+                | MakeAuthRequest (p, h, c, f) ->
+                    let! x = client.MakeAuthAsync(p, h, c) 
+                    return f x
+                | ResolveUsernamRequest (r, f) -> 
+                    let! x = client.SendRequestAsync<TLResolvedPeer>(r) 
+                    return f x
+                | GetHistoryRequest (p, l, f) ->
+                    let! x = client.GetHistoryAsync(p, limit = l) 
+                    return f x
+            }
+
+        let store = Atom.atom Global.empty
 
         let rec invoke update : 'a Async =
-            let runClientEff f e = 
-                async {
-                    let client = (store.Value).client |> TelegramClient.unwrap
-                    let! r = e client
-                    let newEff = store.dispatch ^ fun db -> f r db
-                    return! invoke (fun db -> db, newEff) 
-                }
             async {
                 let oldState = store.Value
                 let eff = store.dispatch update
@@ -157,20 +168,11 @@ module Services =
                 | Terminate (Error e) -> 
                     eprintfn "LOG :: ERROR :: <-e:out- invoke() | state = %O | result = %s" store.Value e
                     return failwith e
-                | Next eff ->
-                    match eff with
-                    | ConnectEff f ->
-                        return! runClientEff f ^ fun client -> async {
-                            do! client.ConnectAsync()    
-                            return client.IsUserAuthorized() }
-                    | SendCodeRequest (phone, f) ->
-                        return! runClientEff f ^ fun client -> async { return! client.SendCodeRequestAsync phone }
-                    | MakeAuthRequest (p, h, c, f) ->
-                        return! runClientEff f ^ fun client -> async { return! client.MakeAuthAsync(p, h, c) }
-                    | ResolveUsernamRequest (r, f) -> 
-                        return! runClientEff f ^ fun client -> async { return! client.SendRequestAsync<Contacts.TLResolvedPeer>(r) }
-                    | GetHistoryRequest (p, l, f) ->
-                        return! runClientEff f ^ fun client -> async { return! client.GetHistoryAsync(p, limit = l) }
+                | Next eff -> 
+                    let client = (store.Value).client |> TelegramClient.unwrap
+                    let! f = executeEff eff client
+                    let newEff = store.dispatch ^ fun db -> f db
+                    return! invoke (fun db -> db, newEff) 
             }
 
 module Server =
