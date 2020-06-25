@@ -5,6 +5,61 @@ open TLSharp.Core
 open TeleSharp.TL
 open TeleSharp.TL.Contacts
 
+module TelegramSync =
+    type Msg = 
+        | MakeMsg of appId : int * apiHash : string
+        | Connect of reply : AsyncReplyChannel<bool>
+        | SendCode of phone : string
+        | MakeAuth of code : string
+        | ResolveUsername of name : string * AsyncReplyChannel<(int * int64) option>
+        | GetHistory of limit : int * id : (int * int64) * AsyncReplyChannel<{| messages : {| created : int; fromId : int option; id : int; message : string |} list; users : {| firstName : string; lastName : string; id : int |} list |}>
+    let init (sessionDir : string) : MailboxProcessor<Msg> =
+        MailboxProcessor.Start(
+            fun inbox ->
+                async {
+                    let mutable _client : TelegramClient = null
+                    let mutable _phone = ""
+                    let mutable _hash = ""
+                    while true do
+                        match! inbox.Receive() with
+                        | MakeMsg (appId, apiHash) -> 
+                            let dir = IO.DirectoryInfo(sessionDir)
+                            dir.Create()
+                            _client <- new TelegramClient (appId, apiHash, FileSessionStore(dir))
+                        | Connect reply ->
+                            do! _client.ConnectAsync()    
+                            reply.Reply <| _client.IsUserAuthorized()
+                        | SendCode phone ->
+                            let! hash = _client.SendCodeRequestAsync(phone)
+                            _phone <- phone
+                            _hash <- hash
+                        | MakeAuth code ->
+                            do! _client.MakeAuthAsync (_phone, _hash, code)
+                        | ResolveUsername (name, reply) ->
+                            let toInputPeerChannel (response : TLResolvedPeer) =
+                                let channel = response.Chats.[0] :?> TLChannel
+                                (channel.Id, channel.AccessHash.Value)
+                            let r = TLRequestResolveUsername(Username = name)
+                            let! r = _client.SendRequestAsync<TLResolvedPeer>(r) 
+                            reply.Reply <| Some (toInputPeerChannel r)
+                        | GetHistory (limit, (id, accessHash), reply) ->
+                            let p = TLInputPeerChannel(ChannelId = id, AccessHash = accessHash)
+                            let! (r : Messages.TLAbsMessages) = _client.GetHistoryAsync(p, limit) 
+                            let channelMessages = r :?> Messages.TLChannelMessages
+                            let users =
+                                channelMessages.Users
+                                |> Seq.map ^ fun x -> x :?> TLUser
+                                |> Seq.map ^ fun x -> {| firstName = x.FirstName; lastName = x.LastName; id = x.Id |}
+                                |> Seq.toList
+                            let messages = 
+                                channelMessages.Messages
+                                |> Seq.choose ^ function | :? TLMessage as x -> Some x | _ -> None
+                                |> Seq.map ^ fun x -> {| created = x.Date; fromId = x.FromId |> Option.ofNullable; id = x.Id; message = x.Message |}
+                                |> Seq.toList
+                            reply.Reply <|  {| messages = messages; users = users |}
+                }
+        )
+
 type Telegram (sessionDir : string) =
     let mutable _client : TelegramClient = null
     let mutable _phone = ""
@@ -13,8 +68,6 @@ type Telegram (sessionDir : string) =
         let dir = IO.DirectoryInfo(sessionDir)
         dir.Create()
         _client <- new TelegramClient (appId, apiHash, FileSessionStore(dir))
-    member _.getPhone () =
-        _client.Session.TLUser.Phone
     member _.connect =
         async {
             do! _client.ConnectAsync()    
