@@ -44,17 +44,21 @@ module Telegram =
         }
 
     let create (sessionDir : string) : MailboxProcessor<Msg> =
+        let dir = IO.DirectoryInfo(sessionDir)
+        dir.Create()
         MailboxProcessor.Start(
             fun inbox ->
                 async {
                     let mutable _client : TelegramClient = null
                     let mutable _phone = ""
                     let mutable _hash = ""
+                    let mutable _appId = 0
+                    let mutable _apiHash = ""
                     while true do
                         match! inbox.Receive() with
                         | ResetClient (appId, apiHash) -> 
-                            let dir = IO.DirectoryInfo(sessionDir)
-                            dir.Create()
+                            _appId <- appId
+                            _apiHash <- apiHash
                             _client <- new TelegramClient (appId, apiHash, FileSessionStore(dir))
                         | Connect reply ->
                             do! _client.ConnectAsync()    
@@ -70,17 +74,21 @@ module Telegram =
                             | Choice1Of2 id -> reply.Reply id
                             | Choice2Of2 e ->
                                 printfn "ResolveUsername ERROR : %O" e
+                                _client.Dispose()
+                                _client <- new TelegramClient (_appId, _apiHash, FileSessionStore(dir))
                                 do! _client.ConnectAsync()
                                 let! id = resolveUsername _client name
                                 reply.Reply id
                         | GetHistory (limit, (id, accessHash), reply) ->
                             match! getHistory _client id accessHash limit |> Async.Catch with
-                            | Choice1Of2 h -> reply.Reply h
+                            | Choice1Of2 history -> reply.Reply history
                             | Choice2Of2 e ->
                                 printfn "GetHistory ERROR : %O" e
+                                _client.Dispose()
+                                _client <- new TelegramClient (_appId, _apiHash, FileSessionStore(dir))
                                 do! _client.ConnectAsync()
-                                let! h = getHistory _client id accessHash limit
-                                reply.Reply h
+                                let! history = getHistory _client id accessHash limit
+                                reply.Reply history
                 }
         )
 
