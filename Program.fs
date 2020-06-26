@@ -57,7 +57,7 @@ module Telegram =
                                 reply.Reply id
                         | GetHistory (limit, (id, accessHash), reply) ->
                             let p = TLInputPeerChannel(ChannelId = id, AccessHash = accessHash)
-                            let! (r : Messages.TLAbsMessages) = _client.GetHistoryAsync(p, limit) 
+                            let! (r : Messages.TLAbsMessages) = _client.GetHistoryAsync(p, limit = limit) 
                             let channelMessages = r :?> Messages.TLChannelMessages
                             let users =
                                 channelMessages.Users
