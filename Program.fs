@@ -25,6 +25,24 @@ module Telegram =
             return Some (toInputPeerChannel r)
         }
 
+    let private getHistory (client : TelegramClient) id accessHash limit =
+        async {
+            let p = TLInputPeerChannel(ChannelId = id, AccessHash = accessHash)
+            let! (r : Messages.TLAbsMessages) = client.GetHistoryAsync(p, limit = limit) 
+            let channelMessages = r :?> Messages.TLChannelMessages
+            let users =
+                channelMessages.Users
+                |> Seq.map ^ fun x -> x :?> TLUser
+                |> Seq.map ^ fun x -> {| firstName = x.FirstName; lastName = x.LastName; id = x.Id |}
+                |> Seq.toList
+            let messages = 
+                channelMessages.Messages
+                |> Seq.choose ^ function | :? TLMessage as x -> Some x | _ -> None
+                |> Seq.map ^ fun x -> {| created = x.Date; fromId = x.FromId |> Option.ofNullable; id = x.Id; message = x.Message |}
+                |> Seq.toList
+            return {| messages = messages; users = users |}
+        }
+
     let create (sessionDir : string) : MailboxProcessor<Msg> =
         MailboxProcessor.Start(
             fun inbox ->
@@ -56,20 +74,13 @@ module Telegram =
                                 let! id = resolveUsername _client name
                                 reply.Reply id
                         | GetHistory (limit, (id, accessHash), reply) ->
-                            let p = TLInputPeerChannel(ChannelId = id, AccessHash = accessHash)
-                            let! (r : Messages.TLAbsMessages) = _client.GetHistoryAsync(p, limit = limit) 
-                            let channelMessages = r :?> Messages.TLChannelMessages
-                            let users =
-                                channelMessages.Users
-                                |> Seq.map ^ fun x -> x :?> TLUser
-                                |> Seq.map ^ fun x -> {| firstName = x.FirstName; lastName = x.LastName; id = x.Id |}
-                                |> Seq.toList
-                            let messages = 
-                                channelMessages.Messages
-                                |> Seq.choose ^ function | :? TLMessage as x -> Some x | _ -> None
-                                |> Seq.map ^ fun x -> {| created = x.Date; fromId = x.FromId |> Option.ofNullable; id = x.Id; message = x.Message |}
-                                |> Seq.toList
-                            reply.Reply <|  {| messages = messages; users = users |}
+                            match! getHistory _client id accessHash limit |> Async.Catch with
+                            | Choice1Of2 h -> reply.Reply h
+                            | Choice2Of2 e ->
+                                printfn "GetHistory ERROR : %O" e
+                                do! _client.ConnectAsync()
+                                let! h = getHistory _client id accessHash limit
+                                reply.Reply h
                 }
         )
 
