@@ -1,19 +1,31 @@
 ﻿module TelegramRest
 
 open System
-open TLSharp.Core
-open TeleSharp.TL
-open TeleSharp.TL.Contacts
 
-module TelegramSync =
+module Telegram =
+    open TLSharp.Core
+    open TeleSharp.TL
+    open TeleSharp.TL.Contacts
+
     type Msg = 
-        | MakeMsg of appId : int * apiHash : string
+        | ResetClient of appId : int * apiHash : string
         | Connect of reply : AsyncReplyChannel<bool>
         | SendCode of phone : string
         | MakeAuth of code : string
         | ResolveUsername of name : string * AsyncReplyChannel<(int * int64) option>
         | GetHistory of limit : int * id : (int * int64) * AsyncReplyChannel<{| messages : {| created : int; fromId : int option; id : int; message : string |} list; users : {| firstName : string; lastName : string; id : int |} list |}>
-    let init (sessionDir : string) : MailboxProcessor<Msg> =
+
+    let private resolveUsername (client : TelegramClient) name =
+        async {
+            let toInputPeerChannel (response : TLResolvedPeer) =
+                let channel = response.Chats.[0] :?> TLChannel
+                (channel.Id, channel.AccessHash.Value)
+            let r = TLRequestResolveUsername(Username = name)
+            let! r = client.SendRequestAsync<TLResolvedPeer>(r) 
+            return Some (toInputPeerChannel r)
+        }
+
+    let create (sessionDir : string) : MailboxProcessor<Msg> =
         MailboxProcessor.Start(
             fun inbox ->
                 async {
@@ -22,7 +34,7 @@ module TelegramSync =
                     let mutable _hash = ""
                     while true do
                         match! inbox.Receive() with
-                        | MakeMsg (appId, apiHash) -> 
+                        | ResetClient (appId, apiHash) -> 
                             let dir = IO.DirectoryInfo(sessionDir)
                             dir.Create()
                             _client <- new TelegramClient (appId, apiHash, FileSessionStore(dir))
@@ -36,12 +48,13 @@ module TelegramSync =
                         | MakeAuth code ->
                             do! _client.MakeAuthAsync (_phone, _hash, code)
                         | ResolveUsername (name, reply) ->
-                            let toInputPeerChannel (response : TLResolvedPeer) =
-                                let channel = response.Chats.[0] :?> TLChannel
-                                (channel.Id, channel.AccessHash.Value)
-                            let r = TLRequestResolveUsername(Username = name)
-                            let! r = _client.SendRequestAsync<TLResolvedPeer>(r) 
-                            reply.Reply <| Some (toInputPeerChannel r)
+                            match! resolveUsername _client name |> Async.Catch with
+                            | Choice1Of2 id -> reply.Reply id
+                            | Choice2Of2 e ->
+                                printfn "ResolveUsername ERROR : %O" e
+                                do! _client.ConnectAsync()
+                                let! id = resolveUsername _client name
+                                reply.Reply id
                         | GetHistory (limit, (id, accessHash), reply) ->
                             let p = TLInputPeerChannel(ChannelId = id, AccessHash = accessHash)
                             let! (r : Messages.TLAbsMessages) = _client.GetHistoryAsync(p, limit) 
@@ -59,57 +72,6 @@ module TelegramSync =
                             reply.Reply <|  {| messages = messages; users = users |}
                 }
         )
-
-type Telegram (sessionDir : string) =
-    let mutable _client : TelegramClient = null
-    let mutable _phone = ""
-    let mutable _hash = ""
-    member _.make appId apiHash =
-        let dir = IO.DirectoryInfo(sessionDir)
-        dir.Create()
-        _client <- new TelegramClient (appId, apiHash, FileSessionStore(dir))
-    member _.connect =
-        async {
-            do! _client.ConnectAsync()    
-            return _client.IsUserAuthorized() 
-        }
-    member _.sendCode phone =
-        async {
-            let! hash = _client.SendCodeRequestAsync(phone)
-            _phone <- phone
-            _hash <- hash
-        }
-    member _.makeAuth c =
-        async {
-            let! _ = _client.MakeAuthAsync(_phone, _hash, c) 
-            ()
-        }
-    member _.resolveUsername name =
-        let toInputPeerChannel (response : TLResolvedPeer) =
-            let channel = response.Chats.[0] :?> TLChannel
-            (channel.Id, channel.AccessHash.Value)
-        async {
-            let r = TLRequestResolveUsername(Username = name)
-            let! r = _client.SendRequestAsync<TLResolvedPeer>(r) 
-            return Some (toInputPeerChannel r)
-        }
-    member _.getHistory l (id, accessHash) =
-        async {
-            let p = TLInputPeerChannel(ChannelId = id, AccessHash = accessHash)
-            let! (r : Messages.TLAbsMessages) = _client.GetHistoryAsync(p, limit = l) 
-            let channelMessages = r :?> Messages.TLChannelMessages
-            let users =
-                channelMessages.Users
-                |> Seq.map ^ fun x -> x :?> TLUser
-                |> Seq.map ^ fun x -> {| firstName = x.FirstName; lastName = x.LastName; id = x.Id |}
-                |> Seq.toList
-            let messages = 
-                channelMessages.Messages
-                |> Seq.choose ^ function | :? TLMessage as x -> Some x | _ -> None
-                |> Seq.map ^ fun x -> {| created = x.Date; fromId = x.FromId |> Option.ofNullable; id = x.Id; message = x.Message |}
-                |> Seq.toList
-            return {| messages = messages; users = users |}
-        }
 
 module Domain =
     type Snapshot = { message : string; author : string; id : string; created : DateTime }
@@ -162,24 +124,29 @@ module ResponseMessages =
         |> System.Text.Json.JsonSerializer.Serialize
 
 module Service =
-    let resetClient setClient connect sendCode r =
+    open Telegram
+
+    let resetClient (telegram : MailboxProcessor<Msg>) r =
         async {
             let (phone, appId, apiHash) = Domain.parseAuthForm r |> Result.unwrap
-            setClient appId apiHash
-            let! isConnected = connect
-            if not isConnected then do! sendCode phone
+            telegram.Post <| ResetClient (appId, apiHash)
+            let! isConnected = telegram.PostAndAsyncReply Connect
+            if not isConnected then 
+                telegram.Post <| SendCode phone
             return ResponseMessages.connectResult isConnected
         }
-    let login makeAuth r =
+    let login (telegram : MailboxProcessor<Msg>) r =
         async {
             let code = Domain.parseString "code" 8 r |> Result.unwrap
-            do! makeAuth code
+            telegram.Post <| MakeAuth code
             return ResponseMessages.successAuthorized
         }
-    let getLastMessages resolveUsername getHistory r =
+    let getLastMessages (telegram : MailboxProcessor<Msg>) r =
         async {
-            let! response = Domain.parseString "chat" 32 r |> Result.unwrap |> resolveUsername
-            let! history = response |> Result.ofOption (ResponseMessages.cantFindChat response) |> Result.unwrap |> getHistory 50
+            let username = Domain.parseString "chat" 32 r |> Result.unwrap
+            let! response = telegram.PostAndAsyncReply (fun r -> ResolveUsername (username, r))
+            let chatId = response |> Result.ofOption (ResponseMessages.cantFindChat response) |> Result.unwrap 
+            let! history = telegram.PostAndAsyncReply (fun r -> GetHistory (25, chatId, r))
             return history |> ResponseMessages.toJsonResponse
         }
 
@@ -189,10 +156,10 @@ module Server =
     open Suave.Operators
 
     let start password =
-        let telegram = Telegram ("__data")
-        let resetClient = Service.resetClient telegram.make telegram.connect telegram.sendCode
-        let login = Service.login telegram.makeAuth
-        let getLastMessages = Service.getLastMessages telegram.resolveUsername telegram.getHistory
+        let telegram = Telegram.create "__data"
+        let resetClient = Service.resetClient telegram
+        let login = Service.login telegram
+        let getLastMessages = Service.getLastMessages telegram
 
         let runCommand g f = 
             request (fun r ctx -> 
