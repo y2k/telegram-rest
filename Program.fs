@@ -16,13 +16,17 @@ module Telegram =
         | GetHistory of limit : int * id : (int * int64) * AsyncReplyChannel<{| messages : {| created : int; fromId : int option; id : int; message : string |} list; users : {| firstName : string; lastName : string; id : int |} list |}>
 
     let private resolveUsername (client : TelegramClient) name =
+        let toInputPeerChannel (response : TLResolvedPeer) =
+            let channel = response.Chats.[0] :?> TLChannel
+            (channel.Id, channel.AccessHash.Value)
         async {
-            let toInputPeerChannel (response : TLResolvedPeer) =
-                let channel = response.Chats.[0] :?> TLChannel
-                (channel.Id, channel.AccessHash.Value)
             let r = TLRequestResolveUsername(Username = name)
-            let! r = client.SendRequestAsync<TLResolvedPeer>(r) 
-            return Some (toInputPeerChannel r)
+            let! r = client.SendRequestAsync<TLResolvedPeer>(r) |> Async.AwaitTask |> Async.Catch
+            return
+                match r with
+                | Choice1Of2 r -> Some (toInputPeerChannel r)
+                | Choice2Of2 (:? AggregateException as e) when e.InnerException.Message = "USERNAME_NOT_OCCUPIED" -> None
+                | Choice2Of2 e -> raise e
         }
 
     let private getHistory (client : TelegramClient) id accessHash limit =
