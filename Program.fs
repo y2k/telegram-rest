@@ -12,22 +12,31 @@ module Telegram =
         | Connect of reply : AsyncReplyChannel<bool>
         | SendCode of phone : string
         | MakeAuth of code : string
-        | ResolveUsername of name : string * AsyncReplyChannel<(int * int64) option>
-        | GetHistory of limit : int * id : (int * int64) * AsyncReplyChannel<{| messages : {| created : int; fromId : int option; id : int; message : string |} list; users : {| firstName : string; lastName : string; id : int |} list |}>
+        | ResolveUsername of name : string * AsyncReplyChannel<(int * int64 option) option>
+        | GetHistory of limit : int * id : (int * int64 option) * AsyncReplyChannel<{| messages : {| created : int; fromId : int option; id : int; message : string |} list; users : {| firstName : string; lastName : string; id : int |} list |}>
 
     let private resolveUsername (client : TelegramClient) name =
+        let toInputPeerChannel (response : TLResolvedPeer) =
+            let nullableToOption (n : Nullable<_>) = 
+               if n.HasValue then Some n.Value else None
+            let channel = response.Chats.[0] :?> TLChannel
+            (channel.Id, nullableToOption channel.AccessHash)
         async {
-            let toInputPeerChannel (response : TLResolvedPeer) =
-                let channel = response.Chats.[0] :?> TLChannel
-                (channel.Id, channel.AccessHash.Value)
             let r = TLRequestResolveUsername(Username = name)
-            let! r = client.SendRequestAsync<TLResolvedPeer>(r) 
-            return Some (toInputPeerChannel r)
+            let! r = client.SendRequestAsync<TLResolvedPeer>(r) |> Async.AwaitTask |> Async.Catch
+            return
+                match r with
+                | Choice1Of2 r -> Some (toInputPeerChannel r)
+                | Choice2Of2 (:? AggregateException as e) when e.InnerException.Message = "USERNAME_NOT_OCCUPIED" -> None
+                | Choice2Of2 e -> raise e
         }
 
     let private getHistory (client : TelegramClient) id accessHash limit =
         async {
-            let p = TLInputPeerChannel(ChannelId = id, AccessHash = accessHash)
+            let p = 
+                match accessHash with
+                | Some accessHash -> TLInputPeerChannel(ChannelId = id, AccessHash = accessHash)
+                | None -> TLInputPeerChannel(ChannelId = id)
             let! (r : Messages.TLAbsMessages) = client.GetHistoryAsync(p, limit = limit) 
             let channelMessages = r :?> Messages.TLChannelMessages
             let users =
@@ -35,7 +44,7 @@ module Telegram =
                 |> Seq.map ^ fun x -> x :?> TLUser
                 |> Seq.map ^ fun x -> {| firstName = x.FirstName; lastName = x.LastName; id = x.Id |}
                 |> Seq.toList
-            let messages = 
+            let messages =
                 channelMessages.Messages
                 |> Seq.choose ^ function | :? TLMessage as x -> Some x | _ -> None
                 |> Seq.map ^ fun x -> {| created = x.Date; fromId = x.FromId |> Option.ofNullable; id = x.Id; message = x.Message |}
@@ -54,6 +63,7 @@ module Telegram =
                     let mutable _hash = ""
                     let mutable _appId = 0
                     let mutable _apiHash = ""
+                    let userIdCache : Map<String, (int * int64 option) option> ref = ref Map.empty
                     while true do
                         match! inbox.Receive() with
                         | ResetClient (appId, apiHash) -> 
@@ -70,15 +80,21 @@ module Telegram =
                         | MakeAuth code ->
                             do! _client.MakeAuthAsync (_phone, _hash, code)
                         | ResolveUsername (name, reply) ->
-                            match! resolveUsername _client name |> Async.Catch with
-                            | Choice1Of2 id -> reply.Reply id
-                            | Choice2Of2 e ->
-                                printfn "ResolveUsername ERROR : %O" e
-                                _client.Dispose()
-                                _client <- new TelegramClient (_appId, _apiHash, FileSessionStore(dir))
-                                do! _client.ConnectAsync()
-                                let! id = resolveUsername _client name
-                                reply.Reply id
+                            match Map.tryFind name !userIdCache with
+                            | Some id -> reply.Reply id
+                            | None ->
+                                match! resolveUsername _client name |> Async.Catch with
+                                | Choice1Of2 id ->
+                                    userIdCache := Map.add name id !userIdCache
+                                    reply.Reply id
+                                | Choice2Of2 e ->
+                                    printfn "ResolveUsername ERROR : %O" e
+                                    _client.Dispose()
+                                    _client <- new TelegramClient (_appId, _apiHash, FileSessionStore(dir))
+                                    do! _client.ConnectAsync()
+                                    let! id = resolveUsername _client name
+                                    userIdCache := Map.add name id !userIdCache
+                                    reply.Reply id
                         | GetHistory (limit, (id, accessHash), reply) ->
                             match! getHistory _client id accessHash limit |> Async.Catch with
                             | Choice1Of2 history -> reply.Reply history
