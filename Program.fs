@@ -119,8 +119,11 @@ module Telegram =
                     let state = { client  = null; phone = ""; hash = ""; appId = 0; apiHash = ""; getHistoryCount = 0L; userIdCache = Map.empty; recreateCount = 0L; dir = dir }
                     while true do
                         let! msg = inbox.Receive()
-                        try do! handleMessage msg state
-                        with e -> printfn "%O :: ERROR (%O): %O" DateTime.Now msg e
+                        try 
+                            printfn "LOG IN = %O" msg
+                            do! handleMessage msg state
+                            printfn "LOG OUT = %O" msg
+                        with e -> eprintfn "%O :: ERROR (%O): %O" DateTime.Now msg e
                 })
 
 module Domain =
