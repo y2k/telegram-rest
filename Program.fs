@@ -207,10 +207,6 @@ module Server =
 
     let start password =
         let telegram = Telegram.create "__data"
-        let resetClient = Service.resetClient telegram
-        let login = Service.login telegram
-        let getLastMessages = Service.getLastMessages telegram
-
         let runCommand g f = 
             request (fun r ctx -> 
                 async {
@@ -219,9 +215,9 @@ module Server =
                 })
             >=> Writers.setMimeType "application/json"
         Authentication.authenticateBasic (fun (_, p) -> p = password) ^ choose [
-            POST >=> path "/reset" >=> runCommand (fun r -> r.form) resetClient
-            POST >=> path "/set-code" >=> runCommand (fun r -> r.form) login
-            GET >=> path "/history" >=> runCommand (fun r -> r.query) getLastMessages ]
+            POST >=> path "/reset" >=> runCommand (fun r -> r.form) (Service.resetClient telegram)
+            POST >=> path "/set-code" >=> runCommand (fun r -> r.form) (Service.login telegram)
+            GET >=> path "/history" >=> runCommand (fun r -> r.query) (Service.getLastMessages telegram) ]
         |> startWebServerAsync { defaultConfig with bindings = [ HttpBinding.createSimple HTTP "0.0.0.0" 8080 ] }
         |> snd
 
