@@ -63,6 +63,7 @@ module Telegram =
                     let mutable _hash = ""
                     let mutable _appId = 0
                     let mutable _apiHash = ""
+                    let mutable _getHistoryCount = 0L
                     let userIdCache : Map<String, (int * int64 option) option> ref = ref Map.empty
                     while true do
                         match! inbox.Receive() with
@@ -96,6 +97,8 @@ module Telegram =
                                     userIdCache := Map.add name id !userIdCache
                                     reply.Reply id
                         | GetHistory (limit, (id, accessHash), reply) ->
+                            _getHistoryCount <- _getHistoryCount + 1L
+                            printfn "(%O) GetHistory count = %O" DateTime.Now _getHistoryCount
                             match! getHistory _client id accessHash limit |> Async.Catch with
                             | Choice1Of2 history -> reply.Reply history
                             | Choice2Of2 e ->
