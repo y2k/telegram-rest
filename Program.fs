@@ -60,7 +60,15 @@ module Telegram =
           mutable apiHash : string
           mutable getHistoryCount : int64
           mutable userIdCache : Map<String, (int * int64 option) option>
+          mutable recreateCount : int64
           dir : IO.DirectoryInfo }
+
+    let recreateClient e state =
+        state.recreateCount <- state.recreateCount + 1L
+        printfn "%O :: RecreateClient (count = %i, IsConnected = %b) because %O" DateTime.Now state.recreateCount state.client.IsConnected e
+        state.client.Dispose()
+        state.client <- new TelegramClient (state.appId, state.apiHash, FileSessionStore(state.dir))
+        state.client.ConnectAsync()
 
     let private handleMessage msg (state : State) =
         async {
@@ -87,23 +95,17 @@ module Telegram =
                         state.userIdCache <- Map.add name id state.userIdCache
                         reply.Reply id
                     | Choice2Of2 e ->
-                        printfn "ResolveUsername ERROR : %O" e
-                        state.client.Dispose()
-                        state.client <- new TelegramClient (state.appId, state.apiHash, FileSessionStore(state.dir))
-                        do! state.client.ConnectAsync()
+                        do! recreateClient e state
                         let! id = resolveUsername state.client name
                         state.userIdCache <- Map.add name id state.userIdCache
                         reply.Reply id
             | GetHistory (limit, (id, accessHash), reply) ->
                 state.getHistoryCount <- state.getHistoryCount + 1L
-                printfn "(%O) GetHistory count = %O" DateTime.Now state.getHistoryCount
+                printfn "%O :: GetHistory (count = %O, IsConnected = %b)" DateTime.Now state.getHistoryCount state.client.IsConnected
                 match! getHistory state.client id accessHash limit |> Async.Catch with
                 | Choice1Of2 history -> reply.Reply history
                 | Choice2Of2 e ->
-                    printfn "GetHistory ERROR : %O" e
-                    state.client.Dispose()
-                    state.client <- new TelegramClient (state.appId, state.apiHash, FileSessionStore(state.dir))
-                    do! state.client.ConnectAsync()
+                    do! recreateClient e state
                     let! history = getHistory state.client id accessHash limit
                     reply.Reply history
         }
@@ -114,11 +116,11 @@ module Telegram =
         MailboxProcessor.Start(
             fun inbox ->
                 async {
-                    let state = { client  = null; phone = ""; hash = ""; appId = 0; apiHash = ""; getHistoryCount = 0L; userIdCache = Map.empty; dir = dir }
+                    let state = { client  = null; phone = ""; hash = ""; appId = 0; apiHash = ""; getHistoryCount = 0L; userIdCache = Map.empty; recreateCount = 0L; dir = dir }
                     while true do
                         let! msg = inbox.Receive()
                         try do! handleMessage msg state
-                        with e -> printfn "ERROR (%O): %O" msg e
+                        with e -> printfn "%O :: ERROR (%O): %O" DateTime.Now msg e
                 })
 
 module Domain =
